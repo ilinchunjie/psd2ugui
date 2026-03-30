@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "psd-export",
+    "ui-orchestrator",
+    "psd2ugui-cli",
+]
+resolver = "2"

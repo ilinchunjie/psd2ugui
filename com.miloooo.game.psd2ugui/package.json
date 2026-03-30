@@ -1,0 +1,13 @@
+{
+  "name": "com.miloooo.game.psd2ugui",
+  "version": "0.3.1",
+  "displayName": "PSD2UGUI",
+  "description": "Convert PSD files into Unity UGUI prefabs through an integrated export, planning, and import pipeline.",
+  "unity": "2022.3",
+  "author": {
+    "name": "miloooo"
+  },
+  "dependencies": {
+    "com.unity.nuget.newtonsoft-json": "3.2.2"
+  }
+}
