@@ -3,10 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::{OrchestratorError, Result};
-use crate::models::{
-    COMPONENT_BUTTON, COMPONENT_CONTAINER, COMPONENT_IMAGE_PLACEHOLDER, COMPONENT_MASK_GROUP,
-    COMPONENT_SCROLL_VIEW, COMPONENT_TMP_TEXT, PlanNode, UiPlan,
-};
+use crate::models::{COMPONENT_CONTAINER, COMPONENT_IMAGE, COMPONENT_TEXT, PlanNode, UiPlan};
 
 pub fn load_plan(plan_path: &Path) -> Result<UiPlan> {
     let path = resolve_plan_path(plan_path);
@@ -72,11 +69,8 @@ fn validate_node(node: &PlanNode, node_ids: &mut HashSet<String>, errors: &mut V
 
     let supported = [
         COMPONENT_CONTAINER,
-        COMPONENT_IMAGE_PLACEHOLDER,
-        COMPONENT_TMP_TEXT,
-        COMPONENT_BUTTON,
-        COMPONENT_SCROLL_VIEW,
-        COMPONENT_MASK_GROUP,
+        COMPONENT_IMAGE,
+        COMPONENT_TEXT,
     ];
 
     if !supported.contains(&node.component_type.as_str()) {
@@ -86,7 +80,7 @@ fn validate_node(node: &PlanNode, node_ids: &mut HashSet<String>, errors: &mut V
         ));
     }
 
-    if node.component_type == COMPONENT_TMP_TEXT && node.text.is_none() {
+    if node.component_type == COMPONENT_TEXT && node.text.is_none() {
         errors.push(format!(
             "text node {} is missing text payload",
             node.node_id

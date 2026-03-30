@@ -10,8 +10,7 @@ use crate::manifest::{
     ManifestParagraphRun, ManifestText, load_manifest,
 };
 use crate::models::{
-    COMPONENT_BUTTON, COMPONENT_CONTAINER, COMPONENT_IMAGE_PLACEHOLDER, COMPONENT_MASK_GROUP,
-    COMPONENT_SCROLL_VIEW, COMPONENT_TMP_TEXT, CoverageReport, InteractionSpec, PLAN_VERSION,
+    COMPONENT_CONTAINER, COMPONENT_IMAGE, COMPONENT_TEXT, CoverageReport, PLAN_VERSION,
     PlanDocument, PlanNode, PlanRect, RecoveredText, RecoveredTextCharacterRun,
     RecoveredTextParagraphRun, ReviewItem, SourceBundle, TextRecoveryReport, UiPlan,
     ValidationReport,
@@ -31,7 +30,6 @@ struct PlannerState {
     component_summary: BTreeMap<String, usize>,
     visible_layer_ids: BTreeSet<String>,
     mapped_layer_ids: BTreeSet<String>,
-    clip_target_ids: HashSet<String>,
     text_recovery: TextRecoveryReport,
 }
 
@@ -64,7 +62,6 @@ pub fn build_plan(
 ) -> Result<(UiPlan, ValidationReport)> {
     let mut state = PlannerState::default();
     collect_visible_layer_ids(&manifest.layers, &mut state.visible_layer_ids);
-    collect_clip_targets(&manifest.layers, &mut state.clip_target_ids);
 
     let document_id = derive_document_id(bundle_dir);
     let bundle_dir_string = bundle_dir.to_string_lossy().replace('\\', "/");
@@ -197,12 +194,11 @@ fn plan_layer(
         .collect::<Vec<_>>();
     visible_children.sort_by_key(|child| child.stack_index);
 
-    let component = classify_component(layer, &visible_children, &resolved_bounds, state, is_root);
+    let component = classify_component(layer, &visible_children, &resolved_bounds, is_root);
     let mut needs_review = false;
     let mut text = None;
-    let mut interaction = None;
 
-    if component == COMPONENT_TMP_TEXT {
+    if component == COMPONENT_TEXT {
         if let Some(candidate) = recover_text(layer, &resolved_bounds) {
             needs_review = candidate.needs_review;
             state.text_recovery.recovered_from_manifest += 1;
@@ -227,22 +223,6 @@ fn plan_layer(
                     .to_string(),
             });
         }
-    }
-
-    if component == COMPONENT_SCROLL_VIEW {
-        interaction = Some(InteractionSpec {
-            kind: "scroll".to_string(),
-            horizontal: Some(false),
-            vertical: Some(true),
-            content_rect: Some(content_rect(layer, &resolved_bounds)),
-        });
-    } else if component == COMPONENT_BUTTON {
-        interaction = Some(InteractionSpec {
-            kind: "button".to_string(),
-            horizontal: None,
-            vertical: None,
-            content_rect: None,
-        });
     }
 
     if has_unbaked_effects(layer) {
@@ -276,11 +256,11 @@ fn plan_layer(
         rect: plan_rect(&resolved_bounds, parent_bounds),
         render_order: layer.stack_index,
         children: child_plans.into_iter().map(|item| item.node).collect(),
-        confidence: component_confidence(layer, component, text.as_ref()),
+        confidence: component_confidence(component, text.as_ref()),
         needs_review,
         metadata: build_metadata(layer, component, &resolved_bounds),
         text,
-        interaction,
+        interaction: None,
     };
 
     *state
@@ -291,30 +271,11 @@ fn plan_layer(
     LayerPlan { node }
 }
 
-fn component_confidence(
-    layer: &ManifestLayer,
-    component: &str,
-    text: Option<&RecoveredText>,
-) -> f32 {
+fn component_confidence(component: &str, text: Option<&RecoveredText>) -> f32 {
     match component {
         COMPONENT_CONTAINER => 1.0,
-        COMPONENT_BUTTON => {
-            if button_name_hint(&layer.name) {
-                0.95
-            } else {
-                0.72
-            }
-        }
-        COMPONENT_SCROLL_VIEW => {
-            if scroll_name_hint(&layer.name) {
-                0.92
-            } else {
-                0.7
-            }
-        }
-        COMPONENT_MASK_GROUP => 0.86,
-        COMPONENT_TMP_TEXT => text.map(|item| item.confidence).unwrap_or(0.35),
-        COMPONENT_IMAGE_PLACEHOLDER => 0.99,
+        COMPONENT_TEXT => text.map(|item| item.confidence).unwrap_or(0.35),
+        COMPONENT_IMAGE => 0.99,
         _ => 0.5,
     }
 }
@@ -368,7 +329,6 @@ fn classify_component<'a>(
     layer: &'a ManifestLayer,
     visible_children: &[&'a ManifestLayer],
     resolved_bounds: &ManifestBounds,
-    state: &PlannerState,
     is_root: bool,
 ) -> &'static str {
     if is_root {
@@ -376,23 +336,14 @@ fn classify_component<'a>(
     }
 
     if !visible_children.is_empty() {
-        if is_scroll_candidate(layer, visible_children) {
-            return COMPONENT_SCROLL_VIEW;
-        }
-        if is_button_candidate(layer, visible_children, resolved_bounds) {
-            return COMPONENT_BUTTON;
-        }
-        if is_mask_group_candidate(layer, visible_children, state) {
-            return COMPONENT_MASK_GROUP;
-        }
         return COMPONENT_CONTAINER;
     }
 
     if recover_text(layer, resolved_bounds).is_some() {
-        return COMPONENT_TMP_TEXT;
+        return COMPONENT_TEXT;
     }
 
-    COMPONENT_IMAGE_PLACEHOLDER
+    COMPONENT_IMAGE
 }
 
 fn recover_text(layer: &ManifestLayer, _bounds: &ManifestBounds) -> Option<RecoveredTextCandidate> {
@@ -481,20 +432,6 @@ fn infer_mask_mode(mask_bounds: &ManifestBounds, resolved_bounds: &ManifestBound
     }
 }
 
-fn content_rect(layer: &ManifestLayer, fallback: &ManifestBounds) -> PlanRect {
-    let mut union: Option<ManifestBounds> = None;
-    for child in layer.children.iter().filter(|child| child.visible) {
-        let child_bounds = resolve_bounds(child);
-        union = Some(match union {
-            None => child_bounds,
-            Some(current) => union_bounds(&current, &child_bounds),
-        });
-    }
-
-    let target = union.unwrap_or_else(|| fallback.clone());
-    plan_rect(&target, fallback)
-}
-
 fn plan_rect(bounds: &ManifestBounds, parent_bounds: &ManifestBounds) -> PlanRect {
     PlanRect {
         x: bounds.x,
@@ -555,15 +492,6 @@ fn collect_visible_layer_ids(layers: &[ManifestLayer], visible_ids: &mut BTreeSe
     }
 }
 
-fn collect_clip_targets(layers: &[ManifestLayer], clip_targets: &mut HashSet<String>) {
-    for layer in layers {
-        if let Some(target) = &layer.clip_to {
-            clip_targets.insert(target.clone());
-        }
-        collect_clip_targets(&layer.children, clip_targets);
-    }
-}
-
 fn derive_document_id(bundle_dir: &Path) -> String {
     sanitize_identifier(
         &bundle_dir
@@ -620,77 +548,6 @@ fn effect_baked_keys(value: Option<&Value>) -> HashSet<&str> {
         .flatten()
         .filter_map(Value::as_str)
         .collect()
-}
-
-fn is_mask_group_candidate(
-    layer: &ManifestLayer,
-    visible_children: &[&ManifestLayer],
-    state: &PlannerState,
-) -> bool {
-    if layer.mask.is_some() {
-        return true;
-    }
-
-    visible_children
-        .iter()
-        .any(|child| child.clip_to.is_some() || state.clip_target_ids.contains(&child.id))
-}
-
-fn is_button_candidate(
-    layer: &ManifestLayer,
-    visible_children: &[&ManifestLayer],
-    resolved_bounds: &ManifestBounds,
-) -> bool {
-    if button_name_hint(&layer.name) {
-        return true;
-    }
-
-    if visible_children.len() < 2 || visible_children.len() > 6 {
-        return false;
-    }
-
-    let has_text_child = visible_children
-        .iter()
-        .any(|child| recover_text(child, &resolve_bounds(child)).is_some());
-
-    if !has_text_child {
-        return false;
-    }
-
-    visible_children.iter().any(|child| {
-        let child_bounds = resolve_bounds(child);
-        let child_area = child_bounds.width.max(0) * child_bounds.height.max(0);
-        let parent_area = resolved_bounds.width.max(1) * resolved_bounds.height.max(1);
-        child_area * 10 >= parent_area * 6 && matches!(child.layer_type.as_str(), "shape" | "pixel")
-    })
-}
-
-fn is_scroll_candidate(layer: &ManifestLayer, visible_children: &[&ManifestLayer]) -> bool {
-    if scroll_name_hint(&layer.name) {
-        return true;
-    }
-
-    layer.mask.is_some() && visible_children.len() >= 4
-}
-
-fn button_name_hint(name: &str) -> bool {
-    let normalized = name.to_ascii_lowercase();
-    normalized.contains("button")
-        || normalized.contains("btn")
-        || name.contains("\u{6309}\u{94ae}")
-        || name.contains("\u{9886}\u{53d6}")
-        || name.contains("\u{786e}\u{8ba4}")
-        || name.contains("\u{8fd4}\u{56de}")
-}
-
-fn scroll_name_hint(name: &str) -> bool {
-    let normalized = name.to_ascii_lowercase();
-    normalized.contains("scroll")
-        || normalized.contains("viewport")
-        || normalized.contains("content")
-        || normalized.contains("list")
-        || name.contains("\u{5217}\u{8868}")
-        || name.contains("\u{6eda}\u{52a8}")
 }
 
 #[cfg(test)]
@@ -825,7 +682,7 @@ mod tests {
     }
 
     #[test]
-    fn detects_button_groups_from_name() {
+    fn groups_named_like_buttons_are_still_containers() {
         let button_group = ManifestLayer {
             id: "button".to_string(),
             name: "Claim Button".to_string(),
@@ -873,7 +730,66 @@ mod tests {
         )
         .expect("plan should build");
         assert_eq!(plan.nodes[0].component_type, COMPONENT_CONTAINER);
-        assert_eq!(plan.nodes[0].children[0].component_type, COMPONENT_BUTTON);
+        assert_eq!(plan.nodes[0].children[0].component_type, COMPONENT_CONTAINER);
+    }
+
+    #[test]
+    fn masked_groups_are_still_containers() {
+        let masked_group = ManifestLayer {
+            id: "list".to_string(),
+            name: "Reward List".to_string(),
+            layer_type: "group".to_string(),
+            visible: true,
+            opacity: 1.0,
+            blend_mode: "norm".to_string(),
+            bounds: sample_bounds(10, 20, 160, 80),
+            stack_index: 0,
+            children: vec![
+                leaf("item-1", "Item 1", "pixel", sample_bounds(20, 25, 140, 16)),
+                leaf("item-2", "Item 2", "pixel", sample_bounds(20, 45, 140, 16)),
+                leaf("item-3", "Item 3", "pixel", sample_bounds(20, 65, 140, 16)),
+                leaf("item-4", "Item 4", "pixel", sample_bounds(20, 85, 140, 16)),
+            ],
+            asset: None,
+            mask: Some(crate::manifest::ManifestMask {
+                path: "masks/list.png".to_string(),
+                bounds: sample_bounds(10, 20, 160, 80),
+                default_color: Some(0),
+                disabled: Some(false),
+                extra: Default::default(),
+            }),
+            clip_to: None,
+            text: None,
+            effects: Value::Object(Default::default()),
+            unsupported: Vec::new(),
+        };
+
+        let root = ManifestLayer {
+            id: "screen".to_string(),
+            name: "Screen".to_string(),
+            layer_type: "group".to_string(),
+            visible: true,
+            opacity: 1.0,
+            blend_mode: "norm".to_string(),
+            bounds: sample_bounds(0, 0, 200, 120),
+            stack_index: 0,
+            children: vec![masked_group],
+            asset: None,
+            mask: None,
+            clip_to: None,
+            text: None,
+            effects: Value::Object(Default::default()),
+            unsupported: Vec::new(),
+        };
+
+        let manifest = sample_manifest(vec![root]);
+        let (plan, _) = build_plan(
+            &manifest,
+            Path::new("demo"),
+            Path::new("demo/manifest.json"),
+        )
+        .expect("plan should build");
+        assert_eq!(plan.nodes[0].children[0].component_type, COMPONENT_CONTAINER);
     }
 
     #[test]
@@ -962,7 +878,7 @@ mod tests {
             Path::new("demo/manifest.json"),
         )
         .expect("plan should build");
-        assert_eq!(plan.nodes[0].children[0].component_type, COMPONENT_TMP_TEXT);
+        assert_eq!(plan.nodes[0].children[0].component_type, COMPONENT_TEXT);
         assert_eq!(
             plan.nodes[0].children[0]
                 .text
@@ -1008,7 +924,7 @@ mod tests {
         .expect("plan should build");
         assert_eq!(
             plan.nodes[0].children[0].component_type,
-            COMPONENT_IMAGE_PLACEHOLDER
+            COMPONENT_IMAGE
         );
     }
 

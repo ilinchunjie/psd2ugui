@@ -8,11 +8,8 @@ use crate::manifest::ManifestWarning;
 pub const PLAN_VERSION: &str = "2.0.0";
 
 pub const COMPONENT_CONTAINER: &str = "Container";
-pub const COMPONENT_IMAGE_PLACEHOLDER: &str = "ImagePlaceholder";
-pub const COMPONENT_TMP_TEXT: &str = "TMP_Text";
-pub const COMPONENT_BUTTON: &str = "Button";
-pub const COMPONENT_SCROLL_VIEW: &str = "ScrollView";
-pub const COMPONENT_MASK_GROUP: &str = "MaskGroup";
+pub const COMPONENT_IMAGE: &str = "Image";
+pub const COMPONENT_TEXT: &str = "Text";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiPlan {

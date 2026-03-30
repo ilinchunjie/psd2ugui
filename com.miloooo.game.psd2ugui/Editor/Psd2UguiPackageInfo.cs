@@ -7,7 +7,7 @@ namespace PsdUi.Editor
 {
     internal static class Psd2UguiPackageInfo
     {
-        internal const string WindowsExecutableRelativePath = "Assets/framework/Editor/psd2ugui/Editor/Tools/Win/psd2ugui.exe";
+        internal const string WindowsExecutableRelativePath = "Packages/com.miloooo.game.psd2ugui/Editor/Tools/Win/psd2ugui.exe";
 
         internal static string ProjectRootFileSystemPath =>
             Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
@@ -17,7 +17,7 @@ namespace PsdUi.Editor
 
         internal static string GetWindowsExecutableFileSystemPath()
         {
-            return WindowsExecutableRelativePath;
+            return Path.GetFullPath(Path.Combine(ProjectRootFileSystemPath, WindowsExecutableRelativePath));
         }
 
         internal static bool TryConvertAbsolutePathToAssetPath(

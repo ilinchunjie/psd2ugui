@@ -9,8 +9,8 @@ The planner is intentionally focused on structure and stable metadata:
 
 - it reads `manifest.json` and `preview/document.png`
 - it passes image and mask paths through `ui_plan.json` so the Unity importer can bind real sprites
-- it creates `ImagePlaceholder` nodes for raster content, which Unity later materializes as `Image + Sprite`
-- it attempts text recovery from manifest text blocks first, then from layer-name heuristics
+- it creates `Image` nodes for raster content, which Unity later materializes as `Image + Sprite`
+- it attempts text recovery from manifest text blocks exposed by stage one
 
 ## Usage
 
@@ -58,6 +58,5 @@ The Unity-side importer lives under `D:\ui-auto-gen\unity-project`.
 The planner does not ship OCR in this crate yet. It uses two stages:
 
 1. `manifest.text.content` when stage one exposes text semantics
-2. layer-name heuristics for text-like raster layers
 
-Low-confidence text candidates are downgraded to `ImagePlaceholder` and emitted as review items.
+Layers without usable manifest text payload are emitted as `Image` nodes and surfaced via review items when needed.

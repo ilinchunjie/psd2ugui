@@ -1,8 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using DTT.UI.ProceduralUI;
-using FIR.UI;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using TMPro;
@@ -140,54 +138,19 @@ namespace PsdUi.Editor
             var rectTransform = gameObject.GetComponent<RectTransform>();
             ApplyCenterRect(rectTransform, node.Rect, parentRect);
 
-            var childParent = gameObject.transform;
-            var childParentRect = node.Rect;
-
             switch (node.ComponentType)
             {
-                case "ImagePlaceholder":
+                case "Image":
                     ConfigureImageNode(gameObject, node, assetContext);
                     break;
-                case "TMP_Text":
+                case "Text":
                     ConfigureText(gameObject, node);
-                    break;
-                case "Button":
-                    //GetOrAddComponent<Button>(gameObject);
-                    break;
-                case "ScrollView":
-                    var scrollRect = GetOrAddComponent<ScrollRect>(gameObject);
-                    scrollRect.horizontal = node.Interaction?.Horizontal ?? false;
-                    scrollRect.vertical = node.Interaction?.Vertical ?? true;
-
-                    var viewport = new GameObject("Viewport", typeof(RectTransform), typeof(RectMask2D));
-                    viewport.transform.SetParent(gameObject.transform, false);
-                    ConfigureStretchRect(viewport.GetComponent<RectTransform>());
-
-                    var content = new GameObject("Content", typeof(RectTransform));
-                    content.transform.SetParent(viewport.transform, false);
-                    var contentRect = node.Interaction?.ContentRect ?? node.Rect;
-                    ApplyCenterRect(content.GetComponent<RectTransform>(), contentRect, node.Rect);
-
-                    scrollRect.viewport = viewport.GetComponent<RectTransform>();
-                    scrollRect.content = content.GetComponent<RectTransform>();
-                    childParent = content.transform;
-                    childParentRect = contentRect;
-                    break;
-                case "MaskGroup":
-                    if (string.Equals(GetMetadataString(node.Metadata, "mask_mode"), "rect", StringComparison.OrdinalIgnoreCase))
-                    {
-                        GetOrAddComponent<RectMask2D>(gameObject);
-                    }
-                    else
-                    {
-                        ConfigureMaskNode(gameObject, node, assetContext);
-                    }
                     break;
             }
 
             foreach (var child in node.Children)
             {
-                BuildNodeRecursive(child, childParent, childParentRect, assetContext, nodeNameCounters);
+                BuildNodeRecursive(child, gameObject.transform, node.Rect, assetContext, nodeNameCounters);
             }
 
             gameObject.transform.SetSiblingIndex(Mathf.Max(0, node.RenderOrder));
@@ -207,11 +170,8 @@ namespace PsdUi.Editor
         {
             return componentType switch
             {
-                "ImagePlaceholder" => "img",
-                "TMP_Text" => "txt",
-                "Button" => "box",
-                "ScrollView" => "scroller",
-                "Slider" => "slider",
+                "Image" => "img",
+                "Text" => "txt",
                 _ => "box"
             };
         }
@@ -258,16 +218,6 @@ namespace PsdUi.Editor
             rectTransform.sizeDelta = new Vector2(rect.Width, rect.Height);
         }
 
-        private static void ConfigureStretchRect(RectTransform rectTransform)
-        {
-            rectTransform.anchorMin = Vector2.zero;
-            rectTransform.anchorMax = Vector2.one;
-            rectTransform.pivot = new Vector2(0.5f, 0.5f);
-            rectTransform.offsetMin = Vector2.zero;
-            rectTransform.offsetMax = Vector2.zero;
-            rectTransform.anchoredPosition = Vector2.zero;
-        }
-        
         private static Vector2 CalculateCenteredAnchoredPosition(PlanRectData rect, PlanRectData parentRect)
         {
             // Convert PSD top-left coordinates into a centered anchor/pivot offset.
@@ -278,22 +228,9 @@ namespace PsdUi.Editor
 
 
         private static void ConfigureImageNode(GameObject gameObject, PlanNodeData node, ImportedAssetContext assetContext) {
-            var image = GetOrAddComponent<RoundedImage>(gameObject);
+            var image = GetOrAddComponent<Image>(gameObject);
             image.sprite = LoadSpriteForPath(assetContext, GetMetadataString(node.Metadata, "asset_path"));
             image.color = ApplyOpacity(Color.white, GetNodeOpacity(node));
-            var _ = GetOrAddComponent<UIImage>(gameObject);
-        }
-
-        private static void ConfigureMaskNode(
-            GameObject gameObject,
-            PlanNodeData node,
-            ImportedAssetContext assetContext)
-        {
-            var image = GetOrAddComponent<Image>(gameObject);
-            image.sprite = LoadSpriteForPath(assetContext, GetMetadataString(node.Metadata, "mask_path"));
-            image.color = ApplyOpacity(Color.white, GetNodeOpacity(node));
-            var mask = GetOrAddComponent<Mask>(gameObject);
-            mask.showMaskGraphic = false;
         }
 
         private static void ConfigureText(GameObject gameObject, PlanNodeData node)
@@ -371,35 +308,6 @@ namespace PsdUi.Editor
             }
 
             return TextAlignmentOptions.Left;
-        }
-
-        private static void ConfigureButtonTargetGraphic(GameObject gameObject)
-        {
-            var button = gameObject.GetComponent<Button>();
-            if (button == null)
-            {
-                return;
-            }
-
-            var selfImage = gameObject.GetComponent<Image>();
-            if (selfImage != null && selfImage.sprite != null)
-            {
-                button.targetGraphic = selfImage;
-                return;
-            }
-
-            foreach (var candidate in gameObject.GetComponentsInChildren<Image>(true))
-            {
-                if (candidate == null || candidate.gameObject == gameObject || candidate.sprite == null)
-                {
-                    continue;
-                }
-
-                button.targetGraphic = candidate;
-                return;
-            }
-
-            button.targetGraphic = selfImage;
         }
 
         private static float GetNodeOpacity(PlanNodeData node)
