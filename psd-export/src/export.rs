@@ -73,6 +73,12 @@ struct PreviewOverride {
     asset: AssetRef,
 }
 
+#[derive(Debug)]
+struct ReconstructionResult {
+    nodes: Vec<BuildNode>,
+    synthetic_opener_count: usize,
+}
+
 pub fn export_psd_file(input: &Path, options: ExportOptions) -> Result<ExportManifest> {
     let parsed = psd::parse_psd(
         input,
@@ -205,17 +211,28 @@ fn build_layer_tree(
     layers: Vec<FlatLayer>,
     warnings: &mut Vec<ExportWarning>,
 ) -> Result<Vec<BuildNode>> {
+    let synthetic_closer_count = layers
+        .iter()
+        .filter(|layer| is_synthetic_group_closer(layer))
+        .count();
+
     match reconstruct_bottom_up(layers.clone()) {
-        Ok(nodes) => Ok(nodes),
+        Ok(result) => {
+            push_synthetic_group_closer_warning(synthetic_closer_count, warnings);
+            push_synthetic_group_opener_warning(result.synthetic_opener_count, warnings);
+            Ok(result.nodes)
+        }
         Err(primary_error) => match reconstruct_bottom_up(layers.into_iter().rev().collect()) {
-            Ok(nodes) => {
+            Ok(result) => {
+                push_synthetic_group_closer_warning(synthetic_closer_count, warnings);
+                push_synthetic_group_opener_warning(result.synthetic_opener_count, warnings);
                 warnings.push(ExportWarning::new(
                     "layer-order-fallback",
                     format!(
                         "used reversed raw layer order while rebuilding groups: {primary_error}"
                     ),
                 ));
-                Ok(nodes)
+                Ok(result.nodes)
             }
             Err(secondary_error) => Err(AppError::Manifest(format!(
                 "failed to rebuild PSD layer hierarchy: {primary_error}; reversed fallback also failed: {secondary_error}"
@@ -224,16 +241,103 @@ fn build_layer_tree(
     }
 }
 
-fn reconstruct_bottom_up(layers: Vec<FlatLayer>) -> std::result::Result<Vec<BuildNode>, String> {
-    let mut stack: Vec<Vec<BuildNode>> = vec![Vec::new()];
+fn push_synthetic_group_closer_warning(
+    synthetic_closer_count: usize,
+    warnings: &mut Vec<ExportWarning>,
+) {
+    if synthetic_closer_count == 0 {
+        return;
+    }
 
-    for layer in layers {
-        if layer.group_closer {
+    warnings.push(ExportWarning::new(
+        "synthetic-group-closer",
+        format!(
+            "recovered {synthetic_closer_count} unflagged '</Layer group>' sentinel layer(s) while rebuilding groups"
+        ),
+    ));
+}
+
+fn push_synthetic_group_opener_warning(
+    synthetic_opener_count: usize,
+    warnings: &mut Vec<ExportWarning>,
+) {
+    if synthetic_opener_count == 0 {
+        return;
+    }
+
+    warnings.push(ExportWarning::new(
+        "synthetic-group-opener",
+        format!(
+            "recovered {synthetic_opener_count} unflagged zero-bounds group opener layer(s) while rebuilding groups"
+        ),
+    ));
+}
+
+fn is_synthetic_group_closer(layer: &FlatLayer) -> bool {
+    !layer.group_opener
+        && !layer.group_closer
+        && layer.bounds.width == 0
+        && layer.bounds.height == 0
+        && layer.name == "</Layer group>"
+}
+
+fn is_synthetic_group_opener_candidate(layer: &FlatLayer) -> bool {
+    !layer.group_opener
+        && !layer.group_closer
+        && layer.bounds.width == 0
+        && layer.bounds.height == 0
+        && layer.name != "</Layer group>"
+}
+
+fn reconstruct_bottom_up(
+    layers: Vec<FlatLayer>,
+) -> std::result::Result<ReconstructionResult, String> {
+    let mut stack: Vec<Vec<BuildNode>> = vec![Vec::new()];
+    let mut future_closer_counts = vec![0isize; layers.len() + 1];
+    let mut future_opener_counts = vec![0isize; layers.len() + 1];
+    let mut future_candidate_opener_counts = vec![0isize; layers.len() + 1];
+    let mut synthetic_opener_count = 0usize;
+
+    for index in (0..layers.len()).rev() {
+        let layer = &layers[index];
+        future_closer_counts[index] = future_closer_counts[index + 1]
+            + if layer.group_closer || is_synthetic_group_closer(layer) {
+                1
+            } else {
+                0
+            };
+        future_opener_counts[index] = future_opener_counts[index + 1]
+            + if layer.group_opener { 1 } else { 0 };
+        future_candidate_opener_counts[index] = future_candidate_opener_counts[index + 1]
+            + if is_synthetic_group_opener_candidate(layer) {
+                1
+            } else {
+                0
+            };
+    }
+
+    for (index, layer) in layers.into_iter().enumerate() {
+        let effective_closer = layer.group_closer || is_synthetic_group_closer(&layer);
+        let synthetic_opener_candidate = is_synthetic_group_opener_candidate(&layer);
+
+        if effective_closer {
             stack.push(Vec::new());
             continue;
         }
 
-        if layer.group_opener {
+        let effective_opener = if layer.group_opener {
+            true
+        } else if synthetic_opener_candidate {
+            let final_depth_if_skipped = stack.len() as isize
+                + future_closer_counts[index + 1]
+                - future_opener_counts[index + 1]
+                - future_candidate_opener_counts[index + 1];
+            final_depth_if_skipped > 1
+        } else {
+            false
+        };
+
+        if effective_opener {
             if stack.len() == 1 {
                 return Err(format!(
                     "group opener '{}' had no matching closer",
@@ -245,6 +349,10 @@ fn reconstruct_bottom_up(layers: Vec<FlatLayer>) -> std::result::Result<Vec<Buil
                 .pop()
                 .ok_or_else(|| "group stack underflow".to_string())?;
             let mut node = BuildNode::from_flat_layer(layer);
+            if synthetic_opener_candidate {
+                synthetic_opener_count += 1;
+                node.layer_type = LayerType::Group;
+            }
             node.children = children.into_iter().rev().collect();
             stack
                 .last_mut()
@@ -263,7 +371,10 @@ fn reconstruct_bottom_up(layers: Vec<FlatLayer>) -> std::result::Result<Vec<Buil
         return Err("unbalanced group markers remained after reconstruction".to_string());
     }
 
-    Ok(stack.pop().unwrap().into_iter().rev().collect())
+    Ok(ReconstructionResult {
+        nodes: stack.pop().unwrap().into_iter().rev().collect(),
+        synthetic_opener_count,
+    })
 }
 
 fn assign_ids_and_stack_indices(nodes: &mut [BuildNode], path: &mut Vec<usize>) {
@@ -900,6 +1011,7 @@ impl BuildNode {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::{Path, PathBuf};
 
     use tempfile::tempdir;
@@ -1231,6 +1343,118 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_closer_can_rebalance_tree() {
+        let mut warnings = Vec::new();
+        let nodes = build_layer_tree(
+            vec![
+                synthetic_group_closer_layer(),
+                sample_flat_layer("Pixel", LayerType::Pixel),
+                group_layer("Group"),
+            ],
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].name, "Group");
+        assert_eq!(nodes[0].children.len(), 1);
+        assert_eq!(nodes[0].children[0].name, "Pixel");
+        assert!(
+            !nodes
+                .iter()
+                .flat_map(|node| std::iter::once(node).chain(node.children.iter()))
+                .any(|node| node.name == "</Layer group>")
+        );
+    }
+
+    #[test]
+    fn synthetic_closer_emits_warning_once() {
+        let mut warnings = Vec::new();
+
+        build_layer_tree(
+            vec![
+                synthetic_group_closer_layer(),
+                sample_flat_layer("Pixel", LayerType::Pixel),
+                group_layer("Group"),
+            ],
+            &mut warnings,
+        )
+        .unwrap();
+
+        let synthetic_warnings: Vec<_> = warnings
+            .iter()
+            .filter(|warning| warning.code == "synthetic-group-closer")
+            .collect();
+        assert_eq!(synthetic_warnings.len(), 1);
+        assert_eq!(
+            synthetic_warnings[0].message,
+            "recovered 1 unflagged '</Layer group>' sentinel layer(s) while rebuilding groups"
+        );
+    }
+
+    #[test]
+    fn synthetic_opener_candidate_is_used_when_needed() {
+        let mut warnings = Vec::new();
+        let nodes = build_layer_tree(
+            vec![
+                synthetic_group_closer_layer(),
+                sample_flat_layer("Pixel", LayerType::Pixel),
+                synthetic_group_opener_candidate("Recovered Group"),
+            ],
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].name, "Recovered Group");
+        assert!(matches!(nodes[0].layer_type, LayerType::Group));
+        assert_eq!(nodes[0].children.len(), 1);
+        assert_eq!(nodes[0].children[0].name, "Pixel");
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.code == "synthetic-group-opener")
+        );
+    }
+
+    #[test]
+    fn synthetic_opener_candidate_is_left_as_leaf_when_not_needed() {
+        let mut warnings = Vec::new();
+        let nodes = build_layer_tree(
+            vec![
+                sample_flat_layer("Pixel", LayerType::Pixel),
+                synthetic_group_opener_candidate("Empty Placeholder"),
+            ],
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].name, "Empty Placeholder");
+        assert!(matches!(nodes[0].layer_type, LayerType::Unknown));
+        assert_eq!(nodes[1].name, "Pixel");
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| warning.code != "synthetic-group-opener")
+        );
+    }
+
+    #[test]
+    fn still_fails_when_hierarchy_remains_unbalanced() {
+        let error = build_layer_tree(
+            vec![sample_flat_layer("Pixel", LayerType::Pixel), group_layer("Group")],
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, AppError::Manifest(_)));
+        assert!(error
+            .to_string()
+            .contains("group opener 'Group' had no matching closer"));
+    }
+
+    #[test]
     fn photoshop_backend_errors_on_failed_layer_export() {
         let temp = tempdir().unwrap();
         let mut node = sample_build_node("Badge");
@@ -1338,5 +1562,52 @@ mod tests {
             path_indices: vec![0],
             external_asset: None,
         }
+    }
+
+    fn sample_flat_layer(name: &str, layer_type: LayerType) -> FlatLayer {
+        FlatLayer {
+            raw_index: 0,
+            name: name.to_string(),
+            layer_type,
+            visible: true,
+            opacity: 1.0,
+            blend_mode: "norm".to_string(),
+            bounds: Bounds {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            group_opener: false,
+            group_closer: false,
+            is_clipped: false,
+            image: None,
+            mask: None,
+            text: None,
+            effects: LayerEffects::default(),
+            unsupported: Vec::new(),
+        }
+    }
+
+    fn group_layer(name: &str) -> FlatLayer {
+        let mut layer = sample_flat_layer(name, LayerType::Group);
+        layer.bounds.width = 0;
+        layer.bounds.height = 0;
+        layer.group_opener = true;
+        layer
+    }
+
+    fn synthetic_group_closer_layer() -> FlatLayer {
+        let mut layer = sample_flat_layer("</Layer group>", LayerType::Unknown);
+        layer.bounds.width = 0;
+        layer.bounds.height = 0;
+        layer
+    }
+
+    fn synthetic_group_opener_candidate(name: &str) -> FlatLayer {
+        let mut layer = sample_flat_layer(name, LayerType::Unknown);
+        layer.bounds.width = 0;
+        layer.bounds.height = 0;
+        layer
     }
 }
