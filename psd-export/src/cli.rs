@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 
 use crate::Result;
-use crate::export::{self, ExportOptions, RasterBackend};
+use crate::export::{self, ExportOptions};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -21,23 +21,6 @@ enum Commands {
     Export(ExportArgs),
 }
 
-#[derive(Clone, Debug, ValueEnum)]
-enum RasterBackendArg {
-    Rawpsd,
-    Photoshop,
-    Auto,
-}
-
-impl From<RasterBackendArg> for RasterBackend {
-    fn from(value: RasterBackendArg) -> Self {
-        match value {
-            RasterBackendArg::Rawpsd => RasterBackend::RawPsd,
-            RasterBackendArg::Photoshop => RasterBackend::Photoshop,
-            RasterBackendArg::Auto => RasterBackend::Auto,
-        }
-    }
-}
-
 #[derive(Debug, Args)]
 struct ExportArgs {
     input: PathBuf,
@@ -49,8 +32,6 @@ struct ExportArgs {
     include_hidden: bool,
     #[arg(long, action = clap::ArgAction::SetTrue)]
     strict: bool,
-    #[arg(long, value_enum, default_value_t = RasterBackendArg::Rawpsd)]
-    raster_backend: RasterBackendArg,
     #[arg(long)]
     photoshop_exe: Option<PathBuf>,
     #[arg(long, default_value_t = 120)]
@@ -71,7 +52,6 @@ pub fn run() -> Result<()> {
                     include_hidden: args.include_hidden,
                     with_preview: true,
                     strict: args.strict,
-                    raster_backend: args.raster_backend.into(),
                     photoshop_exe: args.photoshop_exe,
                     photoshop_timeout_sec: args.photoshop_timeout_sec,
                 },
@@ -88,45 +68,3 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use clap::Parser;
-
-    #[test]
-    fn parses_rawpsd_backend_by_default() {
-        let cli =
-            Cli::try_parse_from(["psd-export", "export", "demo.psd", "--out", "out"]).unwrap();
-        let Commands::Export(args) = cli.command;
-        assert!(matches!(args.raster_backend, RasterBackendArg::Rawpsd));
-        assert_eq!(args.photoshop_timeout_sec, 120);
-        assert!(args.photoshop_exe.is_none());
-    }
-
-    #[test]
-    fn parses_photoshop_backend_options() {
-        let cli = Cli::try_parse_from([
-            "psd-export",
-            "export",
-            "demo.psd",
-            "--out",
-            "out",
-            "--raster-backend",
-            "photoshop",
-            "--photoshop-exe",
-            "C:\\Program Files\\Adobe\\Adobe Photoshop 2025\\Photoshop.exe",
-            "--photoshop-timeout-sec",
-            "45",
-        ])
-        .unwrap();
-        let Commands::Export(args) = cli.command;
-        assert!(matches!(args.raster_backend, RasterBackendArg::Photoshop));
-        assert_eq!(args.photoshop_timeout_sec, 45);
-        assert_eq!(
-            args.photoshop_exe,
-            Some(PathBuf::from(
-                "C:\\Program Files\\Adobe\\Adobe Photoshop 2025\\Photoshop.exe"
-            ))
-        );
-    }
-}

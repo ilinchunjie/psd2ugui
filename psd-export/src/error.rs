@@ -12,8 +12,7 @@ pub enum AppError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to encode or decode image data: {0}")]
-    Image(#[from] image::ImageError),
+
     #[error("failed to serialize manifest: {0}")]
     Json(#[from] serde_json::Error),
     #[error("invalid CLI usage: {0}")]
@@ -39,7 +38,7 @@ impl AppError {
             Self::StrictWarnings { .. } => 5,
             Self::Manifest(_) => 6,
             Self::Photoshop(_) => 7,
-            Self::Io { .. } | Self::Image(_) | Self::Json(_) => 1,
+            Self::Io { .. } | Self::Json(_) => 1,
         }
     }
 

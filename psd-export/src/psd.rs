@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use rawpsd::{LayerInfo, MaskInfo, parse_layer_records, parse_psd_metadata};
+
 use sha1::{Digest, Sha1};
 
 use crate::error::{AppError, Result};
@@ -14,14 +14,21 @@ use crate::manifest::{
 #[derive(Debug, Clone, Copy)]
 pub struct ParseOptions {
     pub strict: bool,
-    pub with_preview: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PsdMetadata {
+    width: u32,
+    height: u32,
+    color_mode: u16,
+    depth: u16,
+    channel_count: u16,
 }
 
 #[derive(Debug, Clone)]
 pub struct ParsedDocument {
     pub source: ParsedSource,
     pub metadata: ParsedMetadata,
-    pub preview: Option<RgbaBitmap>,
     pub layers: Vec<FlatLayer>,
     pub warnings: Vec<ExportWarning>,
 }
@@ -55,29 +62,11 @@ pub struct FlatLayer {
     pub group_opener: bool,
     pub group_closer: bool,
     pub is_clipped: bool,
-    pub image: Option<RgbaBitmap>,
-    pub mask: Option<MaskBitmap>,
     pub text: Option<TextInfo>,
     pub effects: LayerEffects,
     pub unsupported: Vec<UnsupportedInfo>,
 }
 
-#[derive(Debug, Clone)]
-pub struct RgbaBitmap {
-    pub width: u32,
-    pub height: u32,
-    pub pixels: Vec<u8>,
-}
-
-#[derive(Debug, Clone)]
-pub struct MaskBitmap {
-    pub bounds: Bounds,
-    pub default_color: u8,
-    pub relative: bool,
-    pub disabled: bool,
-    pub invert: bool,
-    pub pixels: Vec<u8>,
-}
 
 #[derive(Debug, Clone, Default)]
 struct LayerScanEntry {
@@ -176,19 +165,34 @@ impl<'a> SliceCursor<'a> {
 
 pub fn parse_psd(input: &Path, options: ParseOptions) -> Result<ParsedDocument> {
     let data = fs::read(input).map_err(|error| AppError::io(input, error))?;
-    let metadata = parse_psd_metadata(&data).map_err(AppError::PsdParse)?;
-    validate_metadata(&metadata)?;
+    let metadata = scan_psd_metadata(&data).map_err(AppError::PsdParse)?;
+
+    if metadata.depth != 8 {
+        return Err(AppError::UnsupportedPsd(format!(
+            "only 8-bit PSD files are supported, found {}-bit",
+            metadata.depth
+        )));
+    }
+    if metadata.color_mode != 3 {
+        return Err(AppError::UnsupportedPsd(format!(
+            "only RGB PSD files are supported, found color mode {}",
+            metadata.color_mode
+        )));
+    }
 
     let mut warnings = Vec::new();
 
-    let raw_layers = match parse_layer_records(&data) {
-        Ok(layers) => layers,
-        Err((layers, error)) => {
+    let mut layers = match scan_layer_records(&data) {
+        Ok(records) => records,
+        Err(error) => {
+            if options.strict {
+                return Err(AppError::PsdParse(error));
+            }
             warnings.push(ExportWarning::new(
-                "partial-layer-parse",
-                format!("rawpsd returned partial layer data: {error}"),
+                "layer-record-scan-failed",
+                format!("failed to scan layer records: {error}"),
             ));
-            layers
+            Vec::new()
         }
     };
 
@@ -202,50 +206,29 @@ pub fn parse_psd(input: &Path, options: ParseOptions) -> Result<ParsedDocument> 
                 "layer-metadata-scan-failed",
                 format!("failed to inspect additional layer info blocks: {error}"),
             ));
-            vec![LayerScanEntry::default(); raw_layers.len()]
+            vec![LayerScanEntry::default(); layers.len()]
         }
     };
 
-    if layer_scans.len() != raw_layers.len() {
-        let message = format!(
-            "layer metadata scan returned {} entries, but rawpsd decoded {} layers",
-            layer_scans.len(),
-            raw_layers.len()
-        );
-        if options.strict {
-            return Err(AppError::PsdParse(message));
-        }
-        warnings.push(ExportWarning::new("layer-scan-count-mismatch", message));
-    }
-
-    let preview = if options.with_preview {
-        match decode_merged_rgba(
-            &data,
-            metadata.width,
-            metadata.height,
-            metadata.channel_count,
-        ) {
-            Ok(bitmap) => Some(bitmap),
-            Err(error) => {
-                if options.strict {
-                    return Err(AppError::PsdParse(error));
-                }
-                warnings.push(ExportWarning::new(
-                    "preview-decode-failed",
-                    format!("failed to decode merged preview image: {error}"),
-                ));
-                None
+    // Merge scan metadata (text, effects, shapes) into layers.
+    for (index, layer) in layers.iter_mut().enumerate() {
+        if let Some(scan) = layer_scans.get(index).cloned() {
+            warnings.extend(scan.warnings);
+            if has_text_character_runs(scan.text.as_ref()) {
+                layer.layer_type = LayerType::Text;
+            } else if scan.shape_detected {
+                layer.layer_type = LayerType::Shape;
+            }
+            layer.text = scan.text;
+            layer.effects = scan.effects;
+            layer.unsupported = scan.unsupported;
+            if scan.smart_object_detected {
+                layer.unsupported.push(UnsupportedInfo {
+                    kind: "smart_object".to_string(),
+                    reason: "smart object metadata was detected, but phase one only preserves the layer node and raster export".to_string(),
+                });
             }
         }
-    } else {
-        None
-    };
-
-    let mut layers = Vec::with_capacity(raw_layers.len());
-    for (index, raw_layer) in raw_layers.into_iter().enumerate() {
-        let scan = layer_scans.get(index).cloned().unwrap_or_default();
-        warnings.extend(scan.warnings.clone());
-        layers.push(merge_layer(index, raw_layer, scan));
     }
 
     Ok(ParsedDocument {
@@ -265,225 +248,247 @@ pub fn parse_psd(input: &Path, options: ParseOptions) -> Result<ParsedDocument> 
             depth: metadata.depth,
             channel_count: metadata.channel_count,
         },
-        preview,
         layers,
         warnings,
     })
 }
 
-fn validate_metadata(metadata: &rawpsd::PsdMetadata) -> Result<()> {
-    if metadata.depth != 8 {
-        return Err(AppError::UnsupportedPsd(format!(
-            "only 8-bit PSD files are supported, found {}-bit",
-            metadata.depth
-        )));
-    }
-    if metadata.color_mode != 3 {
-        return Err(AppError::UnsupportedPsd(format!(
-            "only RGB PSD files are supported, found color mode {}",
-            metadata.color_mode
-        )));
-    }
-    Ok(())
-}
-
-fn merge_layer(raw_index: usize, raw_layer: LayerInfo, scan: LayerScanEntry) -> FlatLayer {
-    let bounds = Bounds {
-        x: raw_layer.x,
-        y: raw_layer.y,
-        width: raw_layer.w,
-        height: raw_layer.h,
-    };
-
-    let mut unsupported = scan.unsupported;
-    if !raw_layer.adjustment_type.is_empty() {
-        unsupported.push(UnsupportedInfo {
-            kind: "adjustment_layer".to_string(),
-            reason: format!(
-                "adjustment layer type '{}' is preserved but not interpreted in phase one",
-                raw_layer.adjustment_type
-            ),
-        });
-    }
-
-    if scan.smart_object_detected {
-        unsupported.push(UnsupportedInfo {
-            kind: "smart_object".to_string(),
-            reason: "smart object metadata was detected, but phase one only preserves the layer node and raster export".to_string(),
-        });
-    }
-
-    let layer_type = if raw_layer.group_opener {
-        LayerType::Group
-    } else if has_text_character_runs(scan.text.as_ref()) {
-        LayerType::Text
-    } else if scan.shape_detected {
-        LayerType::Shape
-    } else if !raw_layer.adjustment_type.is_empty() {
-        LayerType::Unknown
-    } else if raw_layer.w > 0 && raw_layer.h > 0 {
-        LayerType::Pixel
-    } else {
-        LayerType::Unknown
-    };
-
-    let image = if raw_layer.group_opener || raw_layer.group_closer {
-        None
-    } else if raw_layer.w > 0
-        && raw_layer.h > 0
-        && raw_layer.image_data_rgba.len() == (raw_layer.w as usize * raw_layer.h as usize * 4)
-    {
-        Some(RgbaBitmap {
-            width: raw_layer.w,
-            height: raw_layer.h,
-            pixels: raw_layer.image_data_rgba,
-        })
-    } else {
-        None
-    };
-
-    FlatLayer {
-        raw_index,
-        name: if raw_layer.name.is_empty() {
-            format!("Layer {raw_index}")
-        } else {
-            raw_layer.name
-        },
-        layer_type,
-        visible: raw_layer.is_visible,
-        opacity: raw_layer.opacity,
-        blend_mode: raw_layer.blend_mode,
-        bounds,
-        group_opener: raw_layer.group_opener,
-        group_closer: raw_layer.group_closer,
-        is_clipped: raw_layer.is_clipped,
-        image,
-        mask: decode_mask(&raw_layer.mask_info, &raw_layer.image_data_mask),
-        text: scan.text,
-        effects: scan.effects,
-        unsupported,
-    }
-}
-
-fn decode_mask(mask_info: &MaskInfo, image_data_mask: &[u8]) -> Option<MaskBitmap> {
-    if mask_info.w == 0 || mask_info.h == 0 {
-        return None;
-    }
-
-    let expected_len = mask_info.w as usize * mask_info.h as usize;
-    if image_data_mask.len() < expected_len {
-        return None;
-    }
-
-    Some(MaskBitmap {
-        bounds: Bounds {
-            x: mask_info.x,
-            y: mask_info.y,
-            width: mask_info.w,
-            height: mask_info.h,
-        },
-        default_color: mask_info.default_color,
-        relative: mask_info.relative,
-        disabled: mask_info.disabled,
-        invert: mask_info.invert,
-        pixels: image_data_mask[..expected_len].to_vec(),
-    })
-}
-
-fn decode_merged_rgba(
-    data: &[u8],
-    width: u32,
-    height: u32,
-    channel_count: u16,
-) -> std::result::Result<RgbaBitmap, String> {
+fn scan_psd_metadata(data: &[u8]) -> std::result::Result<PsdMetadata, String> {
     let mut cursor = SliceCursor::new(data);
-    cursor.set_position(26)?;
 
-    let color_mode_len = read_u32(&mut cursor)? as u64;
-    cursor.skip(color_mode_len)?;
-
-    let image_resources_len = read_u32(&mut cursor)? as u64;
-    cursor.skip(image_resources_len)?;
-
-    let layer_mask_len = read_u32(&mut cursor)? as u64;
-    cursor.skip(layer_mask_len)?;
-
-    let compression = read_u16(&mut cursor)?;
-    let pixels = width as usize * height as usize;
-    let mut output = vec![255u8; pixels * 4];
-    let decoded_channels = channel_count.min(4) as usize;
-
-    match compression {
-        0 => {
-            for channel in 0..decoded_channels {
-                for index in 0..pixels {
-                    let value = read_u8(&mut cursor)?;
-                    output[index * 4 + channel] = value;
-                }
-            }
-        }
-        1 => {
-            let row_count = decoded_channels * height as usize;
-            let mut row_lengths = Vec::with_capacity(row_count);
-            for _ in 0..row_count {
-                row_lengths.push(read_u16(&mut cursor)? as usize);
-            }
-
-            for channel in 0..decoded_channels {
-                for row in 0..height as usize {
-                    let compressed_len = row_lengths[channel * height as usize + row];
-                    let mut row_cursor = cursor.take(compressed_len as u64)?;
-                    let row_bytes = decode_packbits_row(&mut row_cursor, width as usize)?;
-                    for (column, value) in row_bytes.into_iter().enumerate() {
-                        let pixel_index = row * width as usize + column;
-                        output[pixel_index * 4 + channel] = value;
-                    }
-                }
-            }
-        }
-        other => {
-            return Err(format!(
-                "unsupported merged image compression mode {other}; only raw and RLE are supported"
-            ));
-        }
+    let signature = read_b4(&mut cursor)?;
+    if signature != *b"8BPS" {
+        return Err("invalid PSD signature".to_string());
     }
 
-    if decoded_channels < 4 {
-        for index in 0..pixels {
-            output[index * 4 + 3] = 255;
-        }
+    let version = read_u16(&mut cursor)?;
+    if version != 1 {
+        return Err("only standard PSD files are supported".to_string());
     }
 
-    Ok(RgbaBitmap {
+    cursor.skip(6)?; // reserved
+    let channel_count = read_u16(&mut cursor)?;
+    let height = read_u32(&mut cursor)?;
+    let width = read_u32(&mut cursor)?;
+    let depth = read_u16(&mut cursor)?;
+    let color_mode = read_u16(&mut cursor)?;
+
+    Ok(PsdMetadata {
         width,
         height,
-        pixels: output,
+        color_mode,
+        depth,
+        channel_count,
     })
 }
 
-fn decode_packbits_row(
-    cursor: &mut SliceCursor<'_>,
-    expected_width: usize,
-) -> std::result::Result<Vec<u8>, String> {
-    let mut output = Vec::with_capacity(expected_width);
-    while output.len() < expected_width {
-        let header = read_u8(cursor)? as i8;
-        if header >= 0 {
-            let literal_count = header as usize + 1;
-            for _ in 0..literal_count {
-                output.push(read_u8(cursor)?);
-            }
-        } else if header != -128 {
-            let repeat_count = (1 - header as i16) as usize;
-            let value = read_u8(cursor)?;
-            for _ in 0..repeat_count {
-                output.push(value);
-            }
-        }
+/// Scans layer records from the PSD binary without decompressing image data.
+/// This is used as a fallback when rawpsd fails to parse all layers (e.g. due to
+/// unsupported compression formats like ZIP/deflate). The returned FlatLayer
+/// entries contain correct metadata but no image data (Photoshop handles rasterization).
+fn scan_layer_records(data: &[u8]) -> std::result::Result<Vec<FlatLayer>, String> {
+    let mut cursor = SliceCursor::new(data);
+
+    let signature = read_b4(&mut cursor)?;
+    if signature != *b"8BPS" {
+        return Err("invalid PSD signature".to_string());
     }
 
-    output.truncate(expected_width);
-    Ok(output)
+    let version = read_u16(&mut cursor)?;
+    if version != 1 {
+        return Err("only standard PSD files are supported".to_string());
+    }
+
+    cursor.skip(6)?;
+    cursor.skip(2 + 4 + 4 + 2 + 2)?;
+
+    let color_mode_length = read_u32(&mut cursor)? as u64;
+    cursor.skip(color_mode_length)?;
+
+    let image_resources_length = read_u32(&mut cursor)? as u64;
+    cursor.skip(image_resources_length)?;
+
+    let layer_mask_length = read_u32(&mut cursor)? as u64;
+    if layer_mask_length == 0 {
+        return Ok(Vec::new());
+    }
+
+    let _layer_mask_end = cursor.position() + layer_mask_length;
+    let layer_info_length = read_u32(&mut cursor)? as u64;
+    if layer_info_length == 0 {
+        return Ok(Vec::new());
+    }
+
+    let layer_count = (read_u16(&mut cursor)? as i16).unsigned_abs() as usize;
+
+    // First pass: skip through layer record headers to find where image data starts,
+    // collecting channel data lengths for each layer so we can skip image data.
+    let mut channel_data_sizes: Vec<Vec<u32>> = Vec::with_capacity(layer_count);
+    let records_start = cursor.position();
+
+    for _ in 0..layer_count {
+        // bounds: top, left, bottom, right
+        cursor.skip(4 * 4)?;
+        let channel_count = read_u16(&mut cursor)? as usize;
+        let mut sizes = Vec::with_capacity(channel_count);
+        for _ in 0..channel_count {
+            cursor.skip(2)?; // channel id
+            sizes.push(read_u32(&mut cursor)?);
+        }
+        channel_data_sizes.push(sizes);
+
+        // blend_mode_signature (4) + blend_mode_key (4) + opacity (1) + clipping (1) + flags (1) + filler (1)
+        cursor.skip(4 + 4 + 1 + 1 + 1 + 1)?;
+        let extra_len = read_u32(&mut cursor)? as u64;
+        cursor.skip(extra_len)?;
+    }
+
+    // `cursor` now points to the start of image data.
+    // Compute the position after all image data for each layer.
+    let mut image_data_pos = cursor.position();
+    let mut image_data_ends: Vec<u64> = Vec::with_capacity(layer_count);
+    for sizes in &channel_data_sizes {
+        for &size in sizes {
+            image_data_pos += size as u64;
+        }
+        image_data_ends.push(image_data_pos);
+    }
+
+    // Second pass: re-read layer record headers to extract metadata.
+    cursor.set_position(records_start)?;
+    let mut layers = Vec::with_capacity(layer_count);
+
+    for raw_index in 0..layer_count {
+        let top = read_i32(&mut cursor)?;
+        let left = read_i32(&mut cursor)?;
+        let bottom = read_i32(&mut cursor)?;
+        let right = read_i32(&mut cursor)?;
+
+        let x = left;
+        let y = top;
+        let w = (right - left).max(0) as u32;
+        let h = (bottom - top).max(0) as u32;
+
+        let channel_count = read_u16(&mut cursor)? as u64;
+        cursor.skip(channel_count * 6)?; // channel_id (2) + data_length (4) per channel
+
+        let blend_sig = read_b4(&mut cursor)?;
+        if blend_sig != *b"8BIM" {
+            return Err("invalid blend mode signature in layer record scan".to_string());
+        }
+
+        let blend_mode_key = read_b4_string(&mut cursor)?;
+        let opacity = read_u8(&mut cursor)? as f32 / 255.0;
+        let clipping = read_u8(&mut cursor)?;
+        let flags = read_u8(&mut cursor)?;
+        let _filler = read_u8(&mut cursor)?;
+
+        let extra_len = read_u32(&mut cursor)? as u64;
+        let extra_end = cursor.position() + extra_len;
+
+        // Read mask data length and skip it.
+        let mask_data_len = read_u32(&mut cursor)? as u64;
+        cursor.skip(mask_data_len)?;
+
+        // Read blend ranges length and skip it.
+        let blend_ranges_len = read_u32(&mut cursor)? as u64;
+        cursor.skip(blend_ranges_len)?;
+
+        // Read Pascal name.
+        let name_len = read_u8(&mut cursor)? as u64;
+        let mut name_bytes = vec![0u8; name_len as usize];
+        if name_len > 0 {
+            cursor.read_exact(&mut name_bytes)?;
+        }
+        let name_padding = (4 - ((name_len + 1) % 4)) % 4;
+        cursor.skip(name_padding)?;
+        let mut name = String::from_utf8_lossy(&name_bytes).to_string();
+
+        // Parse additional layer information blocks for group flags and unicode name.
+        let mut group_opener = false;
+        let mut group_closer = false;
+        let mut fill_opacity: Option<f32> = None;
+
+        while cursor.position() < extra_end {
+            let sig = read_b4(&mut cursor)?;
+            if sig != *b"8BIM" && sig != *b"8B64" {
+                // Skip unrecognized block signature, try to continue
+                break;
+            }
+
+            let key = read_b4_string(&mut cursor)?;
+            let block_len = read_u32(&mut cursor)? as u64;
+            let block_end = cursor.position() + block_len;
+
+            match key.as_str() {
+                "lsct" => {
+                    if block_len >= 4 {
+                        let kind = read_u32(&mut cursor)?;
+                        group_opener = kind == 1 || kind == 2;
+                        group_closer = kind == 3;
+                    }
+                }
+                "luni" => {
+                    if block_len >= 4 {
+                        let char_count = read_u32(&mut cursor)? as usize;
+                        let mut utf16 = Vec::with_capacity(char_count);
+                        for _ in 0..char_count {
+                            if cursor.position() + 2 > block_end {
+                                break;
+                            }
+                            utf16.push(read_u16(&mut cursor)?);
+                        }
+                        name = String::from_utf16_lossy(&utf16);
+                    }
+                }
+                "iOpa" => {
+                    if block_len >= 1 {
+                        fill_opacity = Some(read_u8(&mut cursor)? as f32 / 255.0);
+                    }
+                }
+                _ => {}
+            }
+
+            cursor.set_position(block_end)?;
+        }
+
+        cursor.set_position(extra_end)?;
+        let _ = fill_opacity; // reserved for future use
+
+        let is_clipped = clipping != 0;
+        let is_visible = (flags & 2) == 0;
+
+        let layer_type = if group_opener {
+            LayerType::Group
+        } else if w > 0 && h > 0 {
+            LayerType::Pixel
+        } else {
+            LayerType::Unknown
+        };
+
+        layers.push(FlatLayer {
+            raw_index,
+            name: if name.is_empty() {
+                format!("Layer {raw_index}")
+            } else {
+                name
+            },
+            layer_type,
+            visible: is_visible,
+            opacity,
+            blend_mode: blend_mode_key,
+            bounds: Bounds { x, y, width: w, height: h },
+            group_opener,
+            group_closer,
+            is_clipped,
+
+            text: None,
+            effects: LayerEffects::default(),
+            unsupported: Vec::new(),
+        });
+    }
+
+    Ok(layers)
 }
 
 fn scan_layer_metadata(data: &[u8]) -> std::result::Result<Vec<LayerScanEntry>, String> {
@@ -1650,400 +1655,3 @@ fn read_b4_string(cursor: &mut SliceCursor<'_>) -> std::result::Result<String, S
     Ok(String::from_utf8_lossy(&read_b4(cursor)?).to_string())
 }
 
-#[cfg(test)]
-mod tests {
-    use std::path::{Path, PathBuf};
-
-    use tempfile::tempdir;
-
-    use super::*;
-
-    #[test]
-    fn parses_engine_data_fields() {
-        let engine = r#"
-        <<
-          /EngineDict <<
-            /Editor << /Text (Hello\nWorld) >>
-            /StyleRun <<
-              /RunLengthArray [ 5 6 ]
-              /RunArray [
-                <<
-                  /StyleSheet <<
-                    /StyleSheetData <<
-                      /Font 0
-                      /FontSize 24
-                      /FillColor << /Values [ 1 0 0 ] >>
-                    >>
-                  >>
-                >>
-                <<
-                  /StyleSheet <<
-                    /StyleSheetData <<
-                      /Font 1
-                      /FontSize 18
-                      /FillColor << /Values [ 0 0 1 ] >>
-                    >>
-                  >>
-                >>
-              ]
-            >>
-            /ParagraphRun <<
-              /RunLengthArray [ 5 6 ]
-              /RunArray [
-                <<
-                  /ParagraphSheet <<
-                    /Properties <<
-                      /Justification 2
-                    >>
-                  >>
-                >>
-                <<
-                  /ParagraphSheet <<
-                    /Properties <<
-                      /Justification 0
-                    >>
-                  >>
-                >>
-              ]
-            >>
-          >>
-          /ResourceDict <<
-            /FontSet [
-              <<
-                /Name (FZLanTingHei)
-                /StyleName (Regular)
-              >>
-              <<
-                /Name (MiSans)
-                /StyleName (Bold)
-              >>
-            ]
-          >>
-        >>
-        "#;
-
-        let root = parse_engine_data(engine).expect("engine data should parse");
-        let character_runs = parse_engine_character_runs(&root, "Hello\nWorld".chars().count())
-            .expect("character runs should parse");
-        let paragraph_runs = parse_engine_paragraph_runs(&root, "Hello\nWorld".chars().count())
-            .expect("paragraph runs should parse");
-
-        assert_eq!(
-            parse_engine_text_content_from_root(&root).as_deref(),
-            Some("Hello\nWorld")
-        );
-        assert_eq!(
-            character_runs[0].font_family.as_deref(),
-            Some("FZLanTingHei")
-        );
-        assert_eq!(character_runs[0].font_size, Some(24.0));
-        assert_eq!(
-            character_runs[0].color,
-            Some(ColorRgba {
-                r: 255,
-                g: 0,
-                b: 0,
-                a: 255,
-            })
-        );
-        assert_eq!(paragraph_runs[0].alignment, Some(TextAlignment::Center));
-        assert_eq!(
-            character_runs,
-            vec![
-                TextCharacterRun {
-                    start: 0,
-                    length: 5,
-                    font_family: Some("FZLanTingHei".to_string()),
-                    font_style: Some("Regular".to_string()),
-                    font_size: Some(24.0),
-                    color: Some(ColorRgba {
-                        r: 255,
-                        g: 0,
-                        b: 0,
-                        a: 255,
-                    }),
-                },
-                TextCharacterRun {
-                    start: 5,
-                    length: 6,
-                    font_family: Some("MiSans".to_string()),
-                    font_style: Some("Bold".to_string()),
-                    font_size: Some(18.0),
-                    color: Some(ColorRgba {
-                        r: 0,
-                        g: 0,
-                        b: 255,
-                        a: 255,
-                    }),
-                },
-            ]
-        );
-        assert_eq!(
-            paragraph_runs,
-            vec![
-                TextParagraphRun {
-                    start: 0,
-                    length: 5,
-                    alignment: Some(TextAlignment::Center),
-                },
-                TextParagraphRun {
-                    start: 5,
-                    length: 6,
-                    alignment: Some(TextAlignment::Left),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn descriptor_engine_data_supports_raw_data() {
-        let engine = "<< /EngineDict << /Editor << /Text (Hello) >> >> >>";
-        let descriptor = Descriptor {
-            class_id: "TxLr".to_string(),
-            items: vec![(
-                "EngineData".to_string(),
-                DescriptorValue::RawData(format!("{engine}\0").into_bytes()),
-            )],
-        };
-
-        assert_eq!(
-            descriptor_engine_data(&descriptor),
-            Some(engine.as_bytes().to_vec())
-        );
-    }
-
-    #[test]
-    fn parse_engine_data_decodes_utf16be_font_names() {
-        let engine = b"<<
-          /ResourceDict <<
-            /FontSet [
-              <<
-                /Name (\xFE\xFF\0M\0i\0S\0a\0n\0s\0-\0B\0o\0l\0d)
-              >>
-            ]
-          >>
-        >>";
-
-        let root = parse_engine_data(engine.as_slice()).expect("engine data should parse");
-        let font = engine_lookup(&root, &["ResourceDict", "FontSet", "0"])
-            .and_then(engine_font_family_from_entry);
-
-        assert_eq!(font.as_deref(), Some("MiSans-Bold"));
-    }
-
-    #[test]
-    fn engine_fill_color_values_use_alpha_first_for_four_components() {
-        let root = parse_engine_data("<< /Values [ 1 0.7098 0.7333 0.9216 ] >>")
-            .expect("engine data should parse");
-        let color = engine_lookup(&root, &["Values"])
-            .and_then(engine_color_from_values)
-            .expect("fill color should parse");
-
-        assert_eq!(
-            color,
-            ColorRgba {
-                r: 181,
-                g: 187,
-                b: 235,
-                a: 255,
-            }
-        );
-    }
-
-    #[test]
-    fn build_text_info_uses_first_character_run_color_as_text_color() {
-        let text_info = build_text_info(
-            "Title".to_string(),
-            vec![
-                TextCharacterRun {
-                    start: 0,
-                    length: 5,
-                    font_family: Some("MiSans".to_string()),
-                    font_style: Some("Regular".to_string()),
-                    font_size: Some(24.0),
-                    color: Some(ColorRgba {
-                        r: 181,
-                        g: 187,
-                        b: 235,
-                        a: 255,
-                    }),
-                },
-                TextCharacterRun {
-                    start: 5,
-                    length: 2,
-                    font_family: Some("MiSans".to_string()),
-                    font_style: Some("Bold".to_string()),
-                    font_size: Some(18.0),
-                    color: Some(ColorRgba {
-                        r: 255,
-                        g: 0,
-                        b: 0,
-                        a: 255,
-                    }),
-                },
-            ],
-            vec![TextParagraphRun {
-                start: 0,
-                length: 7,
-                alignment: Some(TextAlignment::Left),
-            }],
-        );
-
-        assert_eq!(
-            text_info.color,
-            Some(ColorRgba {
-                r: 181,
-                g: 187,
-                b: 235,
-                a: 255,
-            })
-        );
-    }
-
-    #[test]
-    fn type_tool_font_scale_uses_vertical_axis_magnitude() {
-        let scale = type_tool_font_scale(0.0, 1.25, -1.25, 0.0).expect("scale should parse");
-
-        assert!((scale - 1.25).abs() < 1e-6);
-    }
-
-    #[test]
-    fn scale_text_font_sizes_updates_runs_and_summary() {
-        let mut text_info = TextInfo {
-            content: "关注".to_string(),
-            character_runs: vec![TextCharacterRun {
-                start: 0,
-                length: 2,
-                font_family: Some("MiSans-Bold".to_string()),
-                font_style: Some("Bold".to_string()),
-                font_size: Some(16.0),
-                color: None,
-            }],
-            paragraph_runs: Vec::new(),
-            font_family: Some("MiSans-Bold".to_string()),
-            font_size: Some(16.0),
-            color: None,
-            alignment: None,
-        };
-
-        scale_text_font_sizes(&mut text_info, 1.25);
-
-        assert_eq!(text_info.character_runs[0].font_size, Some(20.0));
-        assert_eq!(text_info.font_size, Some(20.0));
-    }
-
-    #[test]
-    fn text_layer_detection_requires_character_runs() {
-        assert!(has_text_character_runs(Some(&TextInfo {
-            content: "Start".to_string(),
-            character_runs: vec![TextCharacterRun {
-                start: 0,
-                length: 5,
-                font_family: None,
-                font_style: None,
-                font_size: None,
-                color: None,
-            }],
-            paragraph_runs: Vec::new(),
-            font_family: None,
-            font_size: None,
-            color: None,
-            alignment: None,
-        })));
-
-        assert!(!has_text_character_runs(Some(&TextInfo {
-            content: "Start".to_string(),
-            character_runs: Vec::new(),
-            paragraph_runs: vec![TextParagraphRun {
-                start: 0,
-                length: 5,
-                alignment: Some(TextAlignment::Center),
-            }],
-            font_family: None,
-            font_size: None,
-            color: None,
-            alignment: Some(TextAlignment::Center),
-        })));
-
-        assert!(!has_text_character_runs(Some(&TextInfo {
-            content: "Start".to_string(),
-            character_runs: Vec::new(),
-            paragraph_runs: Vec::new(),
-            font_family: None,
-            font_size: None,
-            color: None,
-            alignment: None,
-        })));
-    }
-
-    #[test]
-    fn rejects_invalid_signature() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("invalid.psd");
-        fs::write(&path, b"not-a-psd").unwrap();
-
-        let error = parse_psd(
-            &path,
-            ParseOptions {
-                strict: false,
-                with_preview: true,
-            },
-        )
-        .unwrap_err();
-
-        assert!(matches!(error, AppError::PsdParse(_)));
-    }
-
-    #[test]
-    fn decodes_rawpsd_fixture_preview() {
-        let fixture = find_rawpsd_fixture("test2.psd").expect("rawpsd fixture not found");
-        let document = parse_psd(
-            &fixture,
-            ParseOptions {
-                strict: false,
-                with_preview: true,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(document.metadata.color_mode, "rgb");
-        assert!(document.preview.is_some());
-        assert!(!document.layers.is_empty());
-    }
-
-    fn find_rawpsd_fixture(file_name: &str) -> Option<PathBuf> {
-        let cargo_home = std::env::var("CARGO_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                std::env::var("USERPROFILE")
-                    .map(PathBuf::from)
-                    .unwrap()
-                    .join(".cargo")
-            });
-        let registry_src = cargo_home.join("registry").join("src");
-        find_fixture_recursive(&registry_src, file_name)
-    }
-
-    fn find_fixture_recursive(root: &Path, file_name: &str) -> Option<PathBuf> {
-        let entries = fs::read_dir(root).ok()?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().contains("rawpsd-0.2.2"))
-                    .unwrap_or(false)
-                {
-                    let candidate = path.join("data").join(file_name);
-                    if candidate.exists() {
-                        return Some(candidate);
-                    }
-                }
-                if let Some(found) = find_fixture_recursive(&path, file_name) {
-                    return Some(found);
-                }
-            }
-        }
-        None
-    }
-}

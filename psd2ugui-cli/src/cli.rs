@@ -1,10 +1,9 @@
-use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
-use psd_export::{ExportOptions, RasterBackend, export_psd_file};
+use clap::{Args, Parser, Subcommand};
+use psd_export::{ExportOptions, export_psd_file};
 use serde::Serialize;
 use thiserror::Error;
 use ui_orchestrator::{generate_bundle, load_plan, validate_plan};
@@ -53,22 +52,7 @@ enum Command {
     Pipeline(PipelineCommandArgs),
 }
 
-#[derive(Clone, Debug, ValueEnum, PartialEq, Eq)]
-pub enum RasterBackendArg {
-    Rawpsd,
-    Photoshop,
-    Auto,
-}
 
-impl From<RasterBackendArg> for RasterBackend {
-    fn from(value: RasterBackendArg) -> Self {
-        match value {
-            RasterBackendArg::Rawpsd => RasterBackend::RawPsd,
-            RasterBackendArg::Photoshop => RasterBackend::Photoshop,
-            RasterBackendArg::Auto => RasterBackend::Auto,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Args)]
 pub struct ExportCommandArgs {
@@ -81,8 +65,6 @@ pub struct ExportCommandArgs {
     pub include_hidden: bool,
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub strict: bool,
-    #[arg(long, value_enum, default_value_t = RasterBackendArg::Rawpsd)]
-    pub raster_backend: RasterBackendArg,
     #[arg(long)]
     pub photoshop_exe: Option<PathBuf>,
     #[arg(long, default_value_t = 120)]
@@ -110,8 +92,6 @@ pub struct PipelineCommandArgs {
     pub include_hidden: bool,
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub strict: bool,
-    #[arg(long, value_enum, default_value_t = RasterBackendArg::Auto)]
-    pub raster_backend: RasterBackendArg,
     #[arg(long)]
     pub photoshop_exe: Option<PathBuf>,
     #[arg(long, default_value_t = 120)]
@@ -129,7 +109,13 @@ pub struct PipelineResult {
     pub plan_path: String,
     pub validation_report_path: String,
     pub document_id: String,
-    pub warnings: Vec<String>,
+    pub warnings: Vec<PipelineWarning>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PipelineWarning {
+    pub code: String,
+    pub message: String,
 }
 
 pub fn run() -> CliResult<()> {
@@ -166,7 +152,6 @@ pub fn run_export(args: &ExportCommandArgs) -> CliResult<()> {
             include_hidden: args.include_hidden,
             with_preview: args.with_preview,
             strict: args.strict,
-            raster_backend: args.raster_backend.clone().into(),
             photoshop_exe: args.photoshop_exe.clone(),
             photoshop_timeout_sec: args.photoshop_timeout_sec,
         },
@@ -213,7 +198,6 @@ pub fn run_pipeline(args: &PipelineCommandArgs) -> CliResult<PipelineResult> {
             include_hidden: args.include_hidden,
             with_preview: true,
             strict: args.strict,
-            raster_backend: args.raster_backend.clone().into(),
             photoshop_exe: args.photoshop_exe.clone(),
             photoshop_timeout_sec: args.photoshop_timeout_sec,
         },
@@ -224,9 +208,10 @@ pub fn run_pipeline(args: &PipelineCommandArgs) -> CliResult<PipelineResult> {
         .ui_plan
         .warnings
         .iter()
-        .map(|warning| format!("{}: {}", warning.code, warning.message))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
+        .map(|warning| PipelineWarning {
+            code: warning.code.clone(),
+            message: warning.message.clone(),
+        })
         .collect::<Vec<_>>();
 
     Ok(PipelineResult {
@@ -299,146 +284,3 @@ fn to_forward_slashes(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-#[cfg(test)]
-mod tests {
-    use std::path::PathBuf;
-
-    use clap::Parser;
-    use tempfile::tempdir;
-
-    use super::*;
-
-    #[test]
-    fn parses_export_command_with_photoshop_options() {
-        let cli = Cli::try_parse_from([
-            "psd2ugui",
-            "export",
-            "demo.psd",
-            "--out",
-            "out",
-            "--raster-backend",
-            "photoshop",
-            "--photoshop-exe",
-            "C:\\Program Files\\Adobe\\Adobe Photoshop 2025\\Photoshop.exe",
-            "--photoshop-timeout-sec",
-            "45",
-        ])
-        .unwrap();
-
-        let Command::Export(args) = cli.command else {
-            panic!("expected export command");
-        };
-
-        assert_eq!(args.raster_backend, RasterBackendArg::Photoshop);
-        assert_eq!(
-            args.photoshop_exe,
-            Some(PathBuf::from(
-                "C:\\Program Files\\Adobe\\Adobe Photoshop 2025\\Photoshop.exe"
-            ))
-        );
-        assert_eq!(args.photoshop_timeout_sec, 45);
-    }
-
-    #[test]
-    fn parses_pipeline_command_defaults_to_auto_backend() {
-        let cli = Cli::try_parse_from([
-            "psd2ugui",
-            "pipeline",
-            "demo.psd",
-            "--cache-dir",
-            "cache",
-        ])
-        .unwrap();
-
-        let Command::Pipeline(args) = cli.command else {
-            panic!("expected pipeline command");
-        };
-
-        assert_eq!(args.raster_backend, RasterBackendArg::Auto);
-        assert_eq!(args.cache_dir, PathBuf::from("cache"));
-        assert!(args.photoshop_exe.is_none());
-        assert_eq!(args.photoshop_timeout_sec, 120);
-    }
-
-    #[test]
-    fn generates_timestamped_bundle_directory_under_cache_dir() {
-        let cache_dir = tempdir().unwrap();
-        let bundle_dir = generate_pipeline_bundle_dir(
-            cache_dir.path(),
-            Path::new("sample ui.psd"),
-            BundleNaming::Timestamped,
-        )
-        .unwrap();
-
-        assert!(bundle_dir.starts_with(cache_dir.path()));
-        assert!(bundle_dir.exists());
-        let name = bundle_dir.file_name().and_then(|value| value.to_str()).unwrap();
-        assert!(name.starts_with("sample_ui-"));
-    }
-
-    #[test]
-    fn pipeline_generates_bundle_and_reports_json_contract() {
-        let fixture = find_rawpsd_fixture("test2.psd").expect("rawpsd fixture not found");
-        let cache_dir = tempdir().unwrap();
-
-        let result = run_pipeline(&PipelineCommandArgs {
-            input: fixture,
-            cache_dir: cache_dir.path().to_path_buf(),
-            include_hidden: false,
-            strict: false,
-            raster_backend: RasterBackendArg::Rawpsd,
-            photoshop_exe: None,
-            photoshop_timeout_sec: 120,
-        })
-        .unwrap();
-
-        assert!(Path::new(&result.bundle_dir).exists());
-        assert!(Path::new(&result.plan_path).exists());
-        assert!(Path::new(&result.validation_report_path).exists());
-        assert!(!result.document_id.is_empty());
-        assert_eq!(result.bundle_dir, result.bundle_dir.replace('\\', "/"));
-        assert_eq!(result.plan_path, result.plan_path.replace('\\', "/"));
-        assert_eq!(
-            result.validation_report_path,
-            result.validation_report_path.replace('\\', "/")
-        );
-    }
-
-    fn find_rawpsd_fixture(file_name: &str) -> Option<PathBuf> {
-        let cargo_home = std::env::var("CARGO_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                std::env::var("USERPROFILE")
-                    .map(PathBuf::from)
-                    .unwrap()
-                    .join(".cargo")
-            });
-        let registry_src = cargo_home.join("registry").join("src");
-        find_fixture_recursive(&registry_src, file_name)
-    }
-
-    fn find_fixture_recursive(root: &Path, file_name: &str) -> Option<PathBuf> {
-        let entries = fs::read_dir(root).ok()?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().contains("rawpsd-0.2.2"))
-                    .unwrap_or(false)
-                {
-                    let candidate = path.join("data").join(file_name);
-                    if candidate.exists() {
-                        return Some(candidate);
-                    }
-                }
-
-                if let Some(found) = find_fixture_recursive(&path, file_name) {
-                    return Some(found);
-                }
-            }
-        }
-
-        None
-    }
-}

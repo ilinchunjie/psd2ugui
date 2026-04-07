@@ -2,27 +2,17 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use image::{GrayImage, ImageBuffer, RgbaImage};
 use sha1::{Digest, Sha1};
 
-use crate::effects::bake_layer_effects;
 use crate::error::{AppError, Result};
 use crate::manifest::{
-    AssetRef, Bounds, DocumentInfo, ExportManifest, ExportWarning, LayerNode, LayerType, MaskRef,
-    SourceInfo,
+    AssetRef, Bounds, DocumentInfo, ExportManifest, ExportWarning, LayerNode, LayerType, SourceInfo,
 };
 use crate::photoshop::{
     self, PhotoshopExportOptions, PhotoshopExportRequest, PhotoshopExportResponse,
     PhotoshopLayerExportRequest, PhotoshopLayerExportResult,
 };
-use crate::psd::{self, FlatLayer, MaskBitmap, ParseOptions, RgbaBitmap};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RasterBackend {
-    RawPsd,
-    Photoshop,
-    Auto,
-}
+use crate::psd::{self, FlatLayer, ParseOptions};
 
 #[derive(Debug, Clone)]
 pub struct ExportOptions {
@@ -30,7 +20,6 @@ pub struct ExportOptions {
     pub include_hidden: bool,
     pub with_preview: bool,
     pub strict: bool,
-    pub raster_backend: RasterBackend,
     pub photoshop_exe: Option<PathBuf>,
     pub photoshop_timeout_sec: u64,
 }
@@ -46,8 +35,6 @@ struct BuildNode {
     blend_mode: String,
     bounds: Bounds,
     children: Vec<BuildNode>,
-    image: Option<RgbaBitmap>,
-    mask: Option<MaskBitmap>,
     text: Option<crate::manifest::TextInfo>,
     effects: crate::manifest::LayerEffects,
     unsupported: Vec<crate::manifest::UnsupportedInfo>,
@@ -86,7 +73,6 @@ pub fn export_psd_file(input: &Path, options: ExportOptions) -> Result<ExportMan
         input,
         ParseOptions {
             strict: options.strict,
-            with_preview: options.with_preview,
         },
     )?;
 
@@ -96,13 +82,7 @@ pub fn export_psd_file(input: &Path, options: ExportOptions) -> Result<ExportMan
     assign_clip_targets(&mut nodes, &mut warnings);
     assign_asset_file_stems(&mut nodes);
 
-    let preview_override = if matches!(options.raster_backend, RasterBackend::RawPsd) {
-        None
-    } else {
-        rasterize_with_photoshop(input, &options, &mut nodes, &mut warnings)?
-    };
-
-    bake_node_effects(&mut nodes, &mut warnings);
+    let preview_override = rasterize_with_photoshop(input, &options, &mut nodes, &mut warnings)?;
 
     if options.strict && !warnings.is_empty() {
         return Err(AppError::StrictWarnings {
@@ -112,20 +92,20 @@ pub fn export_psd_file(input: &Path, options: ExportOptions) -> Result<ExportMan
 
     prepare_output_dirs(&options.out_dir)?;
 
-    let preview_asset = if let Some(preview) = preview_override {
-        copy_staged_asset(
-            &preview.staged_path,
-            &options.out_dir.join("preview").join("document.png"),
-        )?;
-        preview.asset
-    } else {
-        let preview = parsed.preview.as_ref().ok_or_else(|| {
+    let preview_asset = preview_override
+        .map(|preview| -> Result<AssetRef> {
+            copy_staged_asset(
+                &preview.staged_path,
+                &options.out_dir.join("preview").join("document.png"),
+            )?;
+            Ok(preview.asset)
+        })
+        .transpose()?
+        .ok_or_else(|| {
             AppError::Manifest(
-                "preview bitmap is missing; export cannot produce preview/document.png".to_string(),
+                "Photoshop did not produce a preview image; export cannot produce preview/document.png".to_string(),
             )
         })?;
-        write_preview(&options.out_dir, preview)?
-    };
 
     let layers = write_nodes(&options.out_dir, &mut nodes, options.include_hidden)?;
 
@@ -178,33 +158,20 @@ fn rasterize_with_photoshop(
         layers: requests.clone(),
     };
 
-    let response = match photoshop::run_photoshop_export(
+    let response = photoshop::run_photoshop_export(
         &request,
         &PhotoshopExportOptions {
             photoshop_exe: options.photoshop_exe.clone(),
             timeout_sec: options.photoshop_timeout_sec,
         },
         &options.out_dir,
-    ) {
-        Ok(response) => response,
-        Err(error) => {
-            if matches!(options.raster_backend, RasterBackend::Auto) {
-                warnings.push(ExportWarning::new(
-                    "photoshop-export-fallback",
-                    format!("Photoshop raster export failed and fell back to rawpsd: {error}"),
-                ));
-                return Ok(None);
-            }
-            return Err(error);
-        }
-    };
+    )?;
 
     apply_photoshop_response(
         nodes,
         &requests,
         &response,
         &staging_dir,
-        options.raster_backend,
         warnings,
     )
 }
@@ -519,7 +486,7 @@ fn collect_photoshop_layer_requests_recursive(
                 raw_index: node.raw_index,
                 path_indices: node.path_indices.clone(),
                 expected_visible: node.visible,
-                output_png_relpath: asset_relative_path(node),
+                output_png_relpath: format!("images/{}.png", node.asset_file_stem),
             });
         }
         collect_photoshop_layer_requests_recursive(&node.children, include_hidden, requests);
@@ -533,20 +500,11 @@ fn should_request_photoshop_raster(node: &BuildNode, include_hidden: bool) -> bo
         && (include_hidden || node.visible)
 }
 
-fn can_write_image_asset(node: &BuildNode) -> bool {
-    (node.image.is_some() || node.external_asset.is_some())
-        && !matches!(
-            node.layer_type,
-            LayerType::Group | LayerType::Text | LayerType::Unknown
-        )
-}
-
 fn apply_photoshop_response(
     nodes: &mut [BuildNode],
     requests: &[PhotoshopLayerExportRequest],
     response: &PhotoshopExportResponse,
     staging_dir: &Path,
-    backend: RasterBackend,
     warnings: &mut Vec<ExportWarning>,
 ) -> Result<Option<PreviewOverride>> {
     let request_map = requests
@@ -571,11 +529,10 @@ fn apply_photoshop_response(
         &request_map,
         &result_map,
         staging_dir,
-        backend,
         warnings,
     )?;
 
-    preview_override_from_response(response, staging_dir, backend, warnings)
+    preview_override_from_response(response, staging_dir, warnings)
 }
 
 fn apply_photoshop_response_recursive(
@@ -583,20 +540,18 @@ fn apply_photoshop_response_recursive(
     request_map: &HashMap<String, &PhotoshopLayerExportRequest>,
     result_map: &HashMap<String, &PhotoshopLayerExportResult>,
     staging_dir: &Path,
-    backend: RasterBackend,
     warnings: &mut Vec<ExportWarning>,
 ) -> Result<()> {
     for node in nodes {
         if let Some(request) = request_map.get(&node.id) {
             let result = result_map.get(&node.id).copied();
-            apply_photoshop_result_to_node(node, request, result, staging_dir, backend, warnings)?;
+            apply_photoshop_result_to_node(node, request, result, staging_dir, warnings)?;
         }
         apply_photoshop_response_recursive(
             &mut node.children,
             request_map,
             result_map,
             staging_dir,
-            backend,
             warnings,
         )?;
     }
@@ -608,16 +563,13 @@ fn apply_photoshop_result_to_node(
     request: &PhotoshopLayerExportRequest,
     result: Option<&PhotoshopLayerExportResult>,
     staging_dir: &Path,
-    backend: RasterBackend,
     warnings: &mut Vec<ExportWarning>,
 ) -> Result<()> {
     let Some(result) = result else {
-        return handle_photoshop_layer_failure(
-            node,
-            backend,
-            warnings,
-            "Photoshop response did not include this layer".to_string(),
-        );
+        return Err(AppError::Photoshop(format!(
+            "failed to rasterize layer '{}' via Photoshop: Photoshop response did not include this layer",
+            node.name
+        )));
     };
 
     for warning in &result.warnings {
@@ -629,50 +581,37 @@ fn apply_photoshop_result_to_node(
     }
 
     if !result.exported {
-        return handle_photoshop_layer_failure(
-            node,
-            backend,
-            warnings,
-            "Photoshop did not export a PNG for this layer".to_string(),
-        );
+        return Err(AppError::Photoshop(format!(
+            "failed to rasterize layer '{}' via Photoshop: Photoshop did not export a PNG for this layer",
+            node.name
+        )));
     }
 
     let Some(bounds) = result.bounds.clone() else {
-        return handle_photoshop_layer_failure(
-            node,
-            backend,
-            warnings,
-            "Photoshop export did not return layer bounds".to_string(),
-        );
+        return Err(AppError::Photoshop(format!(
+            "failed to rasterize layer '{}' via Photoshop: Photoshop export did not return layer bounds",
+            node.name
+        )));
     };
     let Some(width) = result.width else {
-        return handle_photoshop_layer_failure(
-            node,
-            backend,
-            warnings,
-            "Photoshop export did not return layer width".to_string(),
-        );
+        return Err(AppError::Photoshop(format!(
+            "failed to rasterize layer '{}' via Photoshop: Photoshop export did not return layer width",
+            node.name
+        )));
     };
     let Some(height) = result.height else {
-        return handle_photoshop_layer_failure(
-            node,
-            backend,
-            warnings,
-            "Photoshop export did not return layer height".to_string(),
-        );
+        return Err(AppError::Photoshop(format!(
+            "failed to rasterize layer '{}' via Photoshop: Photoshop export did not return layer height",
+            node.name
+        )));
     };
 
     let staged_path = staging_dir.join(request.output_png_relpath.replace('/', "\\"));
     if !staged_path.exists() {
-        return handle_photoshop_layer_failure(
-            node,
-            backend,
-            warnings,
-            format!(
-                "Photoshop reported success but the staged PNG is missing: {}",
-                staged_path.display()
-            ),
-        );
+        return Err(AppError::Photoshop(format!(
+            "failed to rasterize layer '{}' via Photoshop: staged PNG is missing: {}",
+            node.name, staged_path.display()
+        )));
     }
 
     node.bounds = bounds;
@@ -687,71 +626,33 @@ fn apply_photoshop_result_to_node(
     Ok(())
 }
 
-fn handle_photoshop_layer_failure(
-    node: &BuildNode,
-    backend: RasterBackend,
-    warnings: &mut Vec<ExportWarning>,
-    reason: String,
-) -> Result<()> {
-    if matches!(backend, RasterBackend::Photoshop) {
-        return Err(AppError::Photoshop(format!(
-            "failed to rasterize layer '{}' via Photoshop: {reason}",
-            node.name
-        )));
-    }
-
-    warnings.push(ExportWarning::for_layer(
-        "photoshop-layer-fallback",
-        format!("fell back to rawpsd raster export because {reason}"),
-        node.name.clone(),
-    ));
-    Ok(())
-}
-
 fn preview_override_from_response(
     response: &PhotoshopExportResponse,
     staging_dir: &Path,
-    backend: RasterBackend,
     warnings: &mut Vec<ExportWarning>,
 ) -> Result<Option<PreviewOverride>> {
     let Some(preview_path) = response.preview_path.clone() else {
-        if matches!(backend, RasterBackend::Photoshop) {
-            return Err(AppError::Photoshop(
-                "Photoshop export did not return a preview path".to_string(),
-            ));
-        }
         warnings.push(ExportWarning::new(
-            "photoshop-preview-fallback",
-            "Photoshop export did not return a preview path, so preview/document.png fell back to rawpsd",
+            "photoshop-preview-missing",
+            "Photoshop export did not return a preview path",
         ));
         return Ok(None);
     };
 
     let (Some(width), Some(height)) = (response.preview_width, response.preview_height) else {
-        if matches!(backend, RasterBackend::Photoshop) {
-            return Err(AppError::Photoshop(
-                "Photoshop export did not return preview dimensions".to_string(),
-            ));
-        }
         warnings.push(ExportWarning::new(
-            "photoshop-preview-fallback",
-            "Photoshop export did not return preview dimensions, so preview/document.png fell back to rawpsd",
+            "photoshop-preview-missing",
+            "Photoshop export did not return preview dimensions",
         ));
         return Ok(None);
     };
 
     let staged_path = staging_dir.join(preview_path.replace('/', "\\"));
     if !staged_path.exists() {
-        if matches!(backend, RasterBackend::Photoshop) {
-            return Err(AppError::Photoshop(format!(
-                "Photoshop preview export is missing from staging: {}",
-                staged_path.display()
-            )));
-        }
         warnings.push(ExportWarning::new(
-            "photoshop-preview-fallback",
+            "photoshop-preview-missing",
             format!(
-                "Photoshop preview export was missing from staging, so preview/document.png fell back to rawpsd: {}",
+                "Photoshop preview export is missing from staging: {}",
                 staged_path.display()
             ),
         ));
@@ -768,36 +669,6 @@ fn preview_override_from_response(
     }))
 }
 
-fn bake_node_effects(nodes: &mut [BuildNode], warnings: &mut Vec<ExportWarning>) {
-    for node in nodes {
-        if node.external_asset.is_none() {
-            if let Some(bitmap) = node.image.as_ref() {
-                let outcome = bake_layer_effects(
-                    &node.name,
-                    bitmap,
-                    &node.bounds,
-                    node.mask.as_ref(),
-                    node.clip_to.as_deref(),
-                    &node.effects,
-                );
-
-                warnings.extend(outcome.warnings);
-                if !outcome.baked.is_empty() {
-                    node.effects.baked = outcome.baked;
-                }
-                if let Some(image) = outcome.image {
-                    node.image = Some(image);
-                }
-                if let Some(bounds) = outcome.bounds {
-                    node.bounds = bounds;
-                }
-            }
-        }
-
-        bake_node_effects(&mut node.children, warnings);
-    }
-}
-
 fn prepare_output_dirs(out_dir: &Path) -> Result<()> {
     for dir in [
         out_dir.to_path_buf(),
@@ -808,17 +679,6 @@ fn prepare_output_dirs(out_dir: &Path) -> Result<()> {
         fs::create_dir_all(&dir).map_err(|error| AppError::io(&dir, error))?;
     }
     Ok(())
-}
-
-fn write_preview(out_dir: &Path, bitmap: &RgbaBitmap) -> Result<AssetRef> {
-    let relative_path = "preview/document.png".to_string();
-    let full_path = out_dir.join("preview").join("document.png");
-    write_rgba_bitmap(&full_path, bitmap)?;
-    Ok(AssetRef {
-        path: relative_path,
-        width: bitmap.width,
-        height: bitmap.height,
-    })
 }
 
 fn write_nodes(
@@ -847,32 +707,8 @@ fn write_single_node(
                 height: asset.height,
             })
         } else {
-            let relative_path = asset_relative_path(node);
-            let full_path = out_dir.join(relative_path.replace('/', "\\"));
-            let image = node.image.as_ref().unwrap();
-            write_rgba_bitmap(&full_path, image)?;
-            Some(AssetRef {
-                path: relative_path,
-                width: image.width,
-                height: image.height,
-            })
+            None
         }
-    } else {
-        None
-    };
-
-    let mask = if let Some(mask_bitmap) = &node.mask {
-        let relative_path = format!("masks/{}-{}.png", node.id, slugify(&node.name));
-        let full_path = out_dir.join(relative_path.replace('/', "\\"));
-        write_mask_bitmap(&full_path, mask_bitmap)?;
-        Some(MaskRef {
-            path: relative_path,
-            bounds: mask_bitmap.bounds.clone(),
-            default_color: mask_bitmap.default_color,
-            relative: mask_bitmap.relative,
-            disabled: mask_bitmap.disabled,
-            invert: mask_bitmap.invert,
-        })
     } else {
         None
     };
@@ -890,7 +726,7 @@ fn write_single_node(
         stack_index: node.stack_index,
         children,
         asset,
-        mask,
+        mask: None,
         clip_to: node.clip_to.clone(),
         text: node.text.clone(),
         effects: node.effects.clone(),
@@ -899,14 +735,10 @@ fn write_single_node(
 }
 
 fn should_export_image(node: &BuildNode, include_hidden: bool) -> bool {
-    can_write_image_asset(node)
+    node.external_asset.is_some()
         && node.bounds.width > 0
         && node.bounds.height > 0
         && (include_hidden || node.visible)
-}
-
-fn asset_relative_path(node: &BuildNode) -> String {
-    format!("images/{}.png", node.asset_file_stem)
 }
 
 fn photoshop_path_string(path: &Path) -> String {
@@ -935,28 +767,6 @@ fn copy_staged_asset(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_rgba_bitmap(path: &Path, bitmap: &RgbaBitmap) -> Result<()> {
-    let image = RgbaImage::from_raw(bitmap.width, bitmap.height, bitmap.pixels.clone())
-        .ok_or_else(|| {
-            AppError::Manifest(format!("invalid RGBA buffer size for {}", path.display()))
-        })?;
-    image.save(path)?;
-    Ok(())
-}
-
-fn write_mask_bitmap(path: &Path, bitmap: &MaskBitmap) -> Result<()> {
-    let image: GrayImage = ImageBuffer::from_raw(
-        bitmap.bounds.width,
-        bitmap.bounds.height,
-        bitmap.pixels.clone(),
-    )
-    .ok_or_else(|| {
-        AppError::Manifest(format!("invalid mask buffer size for {}", path.display()))
-    })?;
-    image.save(path)?;
-    Ok(())
-}
-
 fn generate_node_id(path: &[usize], raw_index: usize) -> String {
     let path_key = path
         .iter()
@@ -969,22 +779,6 @@ fn generate_node_id(path: &[usize], raw_index: usize) -> String {
     format!("layer_{}", &hex[..12])
 }
 
-fn slugify(name: &str) -> String {
-    let mut slug = String::new();
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch.to_ascii_lowercase());
-        } else if !slug.ends_with('-') {
-            slug.push('-');
-        }
-    }
-    let slug = slug.trim_matches('-');
-    if slug.is_empty() {
-        "layer".to_string()
-    } else {
-        slug.to_string()
-    }
-}
 
 fn sanitize_file_stem(name: &str) -> String {
     let mut sanitized = String::new();
@@ -1040,19 +834,16 @@ fn is_windows_reserved_name(name: &str) -> bool {
 
 impl BuildNode {
     fn from_flat_layer(layer: FlatLayer) -> Self {
-        let asset_file_stem = sanitize_file_stem(&layer.name);
-        Self {
+        BuildNode {
             raw_index: layer.raw_index,
             name: layer.name,
-            asset_file_stem,
+            asset_file_stem: String::new(),
             layer_type: layer.layer_type,
             visible: layer.visible,
             opacity: layer.opacity,
             blend_mode: layer.blend_mode,
             bounds: layer.bounds,
             children: Vec::new(),
-            image: layer.image,
-            mask: layer.mask,
             text: layer.text,
             effects: layer.effects,
             unsupported: layer.unsupported,
@@ -1066,638 +857,3 @@ impl BuildNode {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::fs;
-    use std::path::{Path, PathBuf};
-
-    use tempfile::tempdir;
-
-    use super::*;
-    use crate::manifest::{ColorRgba, DropShadowEffect, LayerEffects, StrokeEffect};
-
-    #[test]
-    fn exports_rawpsd_fixture_end_to_end() {
-        let fixture = find_rawpsd_fixture("test2.psd").expect("rawpsd fixture not found");
-        let out_dir = tempdir().unwrap();
-
-        let manifest = export_psd_file(
-            &fixture,
-            ExportOptions {
-                out_dir: out_dir.path().join("sample"),
-                include_hidden: false,
-                with_preview: true,
-                strict: false,
-                raster_backend: RasterBackend::RawPsd,
-                photoshop_exe: None,
-                photoshop_timeout_sec: 120,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(manifest.schema_version, "2.1.0");
-        assert_eq!(manifest.layers.len(), 2);
-        assert!(out_dir.path().join("sample").join("manifest.json").exists());
-        assert!(
-            out_dir
-                .path()
-                .join("sample")
-                .join("preview")
-                .join("document.png")
-                .exists()
-        );
-        assert!(out_dir.path().join("sample").join("images").exists());
-    }
-
-    #[test]
-    fn baked_effects_update_asset_size_and_bounds() {
-        let out_dir = tempdir().unwrap();
-        let mut node = sample_build_node("Badge");
-        node.effects = LayerEffects {
-            stroke: Some(StrokeEffect {
-                color: Some(ColorRgba {
-                    r: 255,
-                    g: 0,
-                    b: 0,
-                    a: 255,
-                }),
-                opacity: Some(1.0),
-                size: Some(1.0),
-                position: Some("outside".to_string()),
-                blend_mode: None,
-                enabled: true,
-            }),
-            ..LayerEffects::default()
-        };
-        let mut warnings = Vec::new();
-
-        bake_node_effects(std::slice::from_mut(&mut node), &mut warnings);
-        prepare_output_dirs(out_dir.path()).unwrap();
-        let layer = write_single_node(out_dir.path(), &mut node, false).unwrap();
-
-        assert!(warnings.is_empty());
-        assert_eq!(layer.bounds.x, 9);
-        assert_eq!(layer.bounds.y, 19);
-        assert_eq!(layer.bounds.width, 3);
-        assert_eq!(layer.bounds.height, 3);
-        assert_eq!(layer.effects.baked, vec!["stroke".to_string()]);
-        let asset = layer.asset.expect("asset should exist");
-        assert_eq!(asset.width, 3);
-        assert_eq!(asset.height, 3);
-        assert!(out_dir.path().join(asset.path.replace('/', "\\")).exists());
-    }
-
-    #[test]
-    fn baking_skips_clipped_layers_with_warning() {
-        let mut node = sample_build_node("Shadowed");
-        node.clip_to = Some("layer_base".to_string());
-        node.effects = LayerEffects {
-            drop_shadow: Some(DropShadowEffect {
-                color: Some(ColorRgba {
-                    r: 0,
-                    g: 0,
-                    b: 0,
-                    a: 255,
-                }),
-                opacity: Some(0.5),
-                blur: Some(2.0),
-                distance: Some(4.0),
-                angle: Some(45.0),
-                blend_mode: Some("multiply".to_string()),
-                enabled: true,
-            }),
-            ..LayerEffects::default()
-        };
-        let mut warnings = Vec::new();
-
-        bake_node_effects(std::slice::from_mut(&mut node), &mut warnings);
-
-        assert_eq!(node.bounds.width, 1);
-        assert_eq!(node.bounds.height, 1);
-        assert!(node.effects.baked.is_empty());
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].code, "effects-bake-skipped-clipping");
-    }
-
-    #[test]
-    fn photoshop_merge_updates_asset_size_and_bounds() {
-        let temp = tempdir().unwrap();
-        let staging_dir = temp.path().join(".photoshop-stage");
-        let staged_path = staging_dir.join("images").join("layer_test-badge.png");
-        fs::create_dir_all(staged_path.parent().unwrap()).unwrap();
-        fs::write(&staged_path, b"png-data").unwrap();
-
-        let mut node = sample_build_node("Badge");
-        let requests = vec![PhotoshopLayerExportRequest {
-            id: node.id.clone(),
-            name: node.name.clone(),
-            raw_index: node.raw_index,
-            path_indices: vec![0],
-            expected_visible: true,
-            output_png_relpath: "images/layer_test-badge.png".to_string(),
-        }];
-        let response = PhotoshopExportResponse {
-            preview_path: None,
-            preview_width: None,
-            preview_height: None,
-            warnings: Vec::new(),
-            layers: vec![PhotoshopLayerExportResult {
-                id: node.id.clone(),
-                exported: true,
-                bounds: Some(Bounds {
-                    x: 2,
-                    y: 3,
-                    width: 11,
-                    height: 12,
-                }),
-                width: Some(11),
-                height: Some(12),
-                warnings: Vec::new(),
-            }],
-        };
-        let mut warnings = Vec::new();
-
-        let preview = apply_photoshop_response(
-            std::slice::from_mut(&mut node),
-            &requests,
-            &response,
-            &staging_dir,
-            RasterBackend::Auto,
-            &mut warnings,
-        )
-        .unwrap();
-
-        assert!(preview.is_none());
-        assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.code == "photoshop-preview-fallback")
-        );
-        assert_eq!(node.bounds.x, 2);
-        assert_eq!(node.bounds.y, 3);
-        assert_eq!(node.bounds.width, 11);
-        assert_eq!(node.bounds.height, 12);
-        assert_eq!(node.effects.baked, vec!["photoshop_raster".to_string()]);
-        assert!(node.external_asset.is_some());
-    }
-
-    #[test]
-    fn auto_backend_falls_back_on_failed_layer_export() {
-        let temp = tempdir().unwrap();
-        let mut node = sample_build_node("Badge");
-        let requests = vec![PhotoshopLayerExportRequest {
-            id: node.id.clone(),
-            name: node.name.clone(),
-            raw_index: node.raw_index,
-            path_indices: vec![0],
-            expected_visible: true,
-            output_png_relpath: "images/layer_test-badge.png".to_string(),
-        }];
-        let response = PhotoshopExportResponse {
-            preview_path: None,
-            preview_width: None,
-            preview_height: None,
-            warnings: Vec::new(),
-            layers: vec![PhotoshopLayerExportResult {
-                id: node.id.clone(),
-                exported: false,
-                bounds: None,
-                width: None,
-                height: None,
-                warnings: vec!["render failed".to_string()],
-            }],
-        };
-        let mut warnings = Vec::new();
-
-        let preview = apply_photoshop_response(
-            std::slice::from_mut(&mut node),
-            &requests,
-            &response,
-            &temp.path().join(".photoshop-stage"),
-            RasterBackend::Auto,
-            &mut warnings,
-        )
-        .unwrap();
-
-        assert!(preview.is_none());
-        assert!(node.external_asset.is_none());
-        assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.code == "photoshop-layer-fallback")
-        );
-    }
-
-    #[test]
-    fn photoshop_requests_include_pixel_and_shape_layers_but_exclude_text() {
-        let mut text_node = sample_build_node("Title");
-        text_node.layer_type = LayerType::Text;
-        text_node.text = Some(crate::manifest::TextInfo {
-            content: "Title".to_string(),
-            character_runs: Vec::new(),
-            paragraph_runs: Vec::new(),
-            font_family: None,
-            font_size: None,
-            color: None,
-            alignment: None,
-        });
-        let mut shape_node = sample_build_node("Badge Frame");
-        shape_node.layer_type = LayerType::Shape;
-        shape_node.image = None;
-
-        let requests = collect_photoshop_layer_requests(
-            &[sample_build_node("Badge"), shape_node, text_node],
-            false,
-        );
-
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].name, "Badge");
-        assert_eq!(requests[0].output_png_relpath, "images/Badge.png");
-        assert_eq!(requests[1].name, "Badge Frame");
-        assert_eq!(requests[1].output_png_relpath, "images/Badge Frame.png");
-    }
-
-    #[test]
-    fn non_pixel_layers_do_not_write_assets() {
-        let out_dir = tempdir().unwrap();
-        prepare_output_dirs(out_dir.path()).unwrap();
-
-        let mut text_node = sample_build_node("Title");
-        text_node.layer_type = LayerType::Text;
-        text_node.text = Some(crate::manifest::TextInfo {
-            content: "Title".to_string(),
-            character_runs: Vec::new(),
-            paragraph_runs: Vec::new(),
-            font_family: None,
-            font_size: None,
-            color: None,
-            alignment: None,
-        });
-
-        let layer = write_single_node(out_dir.path(), &mut text_node, false).unwrap();
-
-        assert!(layer.asset.is_none());
-    }
-
-    #[test]
-    fn shape_layers_write_assets_when_photoshop_stages_pngs() {
-        let out_dir = tempdir().unwrap();
-        prepare_output_dirs(out_dir.path()).unwrap();
-
-        let staged_path = out_dir
-            .path()
-            .join("staging")
-            .join("images")
-            .join("Badge Frame.png");
-        fs::create_dir_all(staged_path.parent().unwrap()).unwrap();
-        fs::write(&staged_path, b"png-data").unwrap();
-
-        let mut shape_node = sample_build_node("Badge Frame");
-        shape_node.layer_type = LayerType::Shape;
-        shape_node.image = None;
-        shape_node.external_asset = Some(StagedAsset {
-            staged_path,
-            relative_path: "images/Badge Frame.png".to_string(),
-            width: 16,
-            height: 16,
-        });
-
-        let layer = write_single_node(out_dir.path(), &mut shape_node, false).unwrap();
-
-        let asset = layer
-            .asset
-            .expect("shape layer should emit an asset when Photoshop staged it");
-        assert_eq!(asset.path, "images/Badge Frame.png");
-        assert_eq!(asset.width, 16);
-        assert_eq!(asset.height, 16);
-        assert!(
-            out_dir
-                .path()
-                .join("images")
-                .join("Badge Frame.png")
-                .exists()
-        );
-    }
-
-    #[test]
-    fn duplicate_layer_names_get_unique_asset_paths() {
-        let out_dir = tempdir().unwrap();
-        prepare_output_dirs(out_dir.path()).unwrap();
-
-        let mut nodes = vec![sample_build_node("Badge"), sample_build_node("Badge")];
-        assign_ids_and_stack_indices(&mut nodes, &mut Vec::new());
-        assign_asset_file_stems(&mut nodes);
-
-        let layers = write_nodes(out_dir.path(), &mut nodes, false).unwrap();
-
-        assert_eq!(layers[0].asset.as_ref().unwrap().path, "images/Badge.png");
-        assert_eq!(
-            layers[1].asset.as_ref().unwrap().path,
-            "images/Badge (2).png"
-        );
-        assert!(out_dir.path().join("images").join("Badge.png").exists());
-        assert!(out_dir.path().join("images").join("Badge (2).png").exists());
-    }
-
-    #[test]
-    fn synthetic_closer_can_rebalance_tree() {
-        let mut warnings = Vec::new();
-        let nodes = build_layer_tree(
-            vec![
-                synthetic_group_closer_layer(),
-                sample_flat_layer("Pixel", LayerType::Pixel),
-                group_layer("Group"),
-            ],
-            &mut warnings,
-        )
-        .unwrap();
-
-        assert_eq!(nodes.len(), 1);
-        assert_eq!(nodes[0].name, "Group");
-        assert_eq!(nodes[0].children.len(), 1);
-        assert_eq!(nodes[0].children[0].name, "Pixel");
-        assert!(
-            !nodes
-                .iter()
-                .flat_map(|node| std::iter::once(node).chain(node.children.iter()))
-                .any(|node| node.name == "</Layer group>")
-        );
-    }
-
-    #[test]
-    fn synthetic_closer_emits_warning_once() {
-        let mut warnings = Vec::new();
-
-        build_layer_tree(
-            vec![
-                synthetic_group_closer_layer(),
-                sample_flat_layer("Pixel", LayerType::Pixel),
-                group_layer("Group"),
-            ],
-            &mut warnings,
-        )
-        .unwrap();
-
-        let synthetic_warnings: Vec<_> = warnings
-            .iter()
-            .filter(|warning| warning.code == "synthetic-group-closer")
-            .collect();
-        assert_eq!(synthetic_warnings.len(), 1);
-        assert_eq!(
-            synthetic_warnings[0].message,
-            "recovered 1 unflagged '</Layer group>' sentinel layer(s) while rebuilding groups"
-        );
-    }
-
-    #[test]
-    fn synthetic_opener_candidate_is_used_when_needed() {
-        let mut warnings = Vec::new();
-        let nodes = build_layer_tree(
-            vec![
-                synthetic_group_closer_layer(),
-                sample_flat_layer("Pixel", LayerType::Pixel),
-                synthetic_group_opener_candidate("Recovered Group"),
-            ],
-            &mut warnings,
-        )
-        .unwrap();
-
-        assert_eq!(nodes.len(), 1);
-        assert_eq!(nodes[0].name, "Recovered Group");
-        assert!(matches!(nodes[0].layer_type, LayerType::Group));
-        assert_eq!(nodes[0].children.len(), 1);
-        assert_eq!(nodes[0].children[0].name, "Pixel");
-        assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.code == "synthetic-group-opener")
-        );
-    }
-
-    #[test]
-    fn synthetic_opener_candidate_is_left_as_leaf_when_not_needed() {
-        let mut warnings = Vec::new();
-        let nodes = build_layer_tree(
-            vec![
-                sample_flat_layer("Pixel", LayerType::Pixel),
-                synthetic_group_opener_candidate("Empty Placeholder"),
-            ],
-            &mut warnings,
-        )
-        .unwrap();
-
-        assert_eq!(nodes.len(), 2);
-        assert_eq!(nodes[0].name, "Empty Placeholder");
-        assert!(matches!(nodes[0].layer_type, LayerType::Unknown));
-        assert_eq!(nodes[1].name, "Pixel");
-        assert!(
-            warnings
-                .iter()
-                .all(|warning| warning.code != "synthetic-group-opener")
-        );
-    }
-
-    #[test]
-    fn orphan_opener_is_treated_as_childless_group() {
-        let mut warnings = Vec::new();
-        let nodes = build_layer_tree(
-            vec![sample_flat_layer("Pixel", LayerType::Pixel), group_layer("Group")],
-            &mut warnings,
-        )
-        .unwrap();
-
-        assert_eq!(nodes.len(), 2);
-        assert_eq!(nodes[0].name, "Group");
-        assert!(matches!(nodes[0].layer_type, LayerType::Group));
-        assert!(nodes[0].children.is_empty());
-        assert_eq!(nodes[1].name, "Pixel");
-        assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.code == "orphan-group-opener")
-        );
-    }
-
-    #[test]
-    fn orphan_opener_among_valid_groups_still_works() {
-        let mut warnings = Vec::new();
-        let nodes = build_layer_tree(
-            vec![
-                synthetic_group_closer_layer(),
-                sample_flat_layer("Child", LayerType::Pixel),
-                group_layer("ValidGroup"),
-                group_layer("OrphanGroup"),
-            ],
-            &mut warnings,
-        )
-        .unwrap();
-
-        // OrphanGroup has no closer, so it's childless; ValidGroup has Child
-        let orphan = nodes.iter().find(|n| n.name == "OrphanGroup").unwrap();
-        assert!(orphan.children.is_empty());
-        let valid = nodes.iter().find(|n| n.name == "ValidGroup").unwrap();
-        assert_eq!(valid.children.len(), 1);
-        assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.code == "orphan-group-opener")
-        );
-    }
-
-    #[test]
-    fn photoshop_backend_errors_on_failed_layer_export() {
-        let temp = tempdir().unwrap();
-        let mut node = sample_build_node("Badge");
-        let requests = vec![PhotoshopLayerExportRequest {
-            id: node.id.clone(),
-            name: node.name.clone(),
-            raw_index: node.raw_index,
-            path_indices: vec![0],
-            expected_visible: true,
-            output_png_relpath: "images/layer_test-badge.png".to_string(),
-        }];
-        let response = PhotoshopExportResponse {
-            preview_path: Some("preview/document.png".to_string()),
-            preview_width: Some(100),
-            preview_height: Some(100),
-            warnings: Vec::new(),
-            layers: vec![PhotoshopLayerExportResult {
-                id: node.id.clone(),
-                exported: false,
-                bounds: None,
-                width: None,
-                height: None,
-                warnings: Vec::new(),
-            }],
-        };
-
-        let error = apply_photoshop_response(
-            std::slice::from_mut(&mut node),
-            &requests,
-            &response,
-            &temp.path().join(".photoshop-stage"),
-            RasterBackend::Photoshop,
-            &mut Vec::new(),
-        )
-        .unwrap_err();
-
-        assert!(matches!(error, AppError::Photoshop(_)));
-    }
-
-    fn find_rawpsd_fixture(file_name: &str) -> Option<PathBuf> {
-        let cargo_home = std::env::var("CARGO_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                std::env::var("USERPROFILE")
-                    .map(PathBuf::from)
-                    .unwrap()
-                    .join(".cargo")
-            });
-        let registry_src = cargo_home.join("registry").join("src");
-        find_fixture_recursive(&registry_src, file_name)
-    }
-
-    fn find_fixture_recursive(root: &Path, file_name: &str) -> Option<PathBuf> {
-        let entries = fs::read_dir(root).ok()?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().contains("rawpsd-0.2.2"))
-                    .unwrap_or(false)
-                {
-                    let candidate = path.join("data").join(file_name);
-                    if candidate.exists() {
-                        return Some(candidate);
-                    }
-                }
-                if let Some(found) = find_fixture_recursive(&path, file_name) {
-                    return Some(found);
-                }
-            }
-        }
-        None
-    }
-
-    fn sample_build_node(name: &str) -> BuildNode {
-        BuildNode {
-            raw_index: 0,
-            name: name.to_string(),
-            asset_file_stem: sanitize_file_stem(name),
-            layer_type: LayerType::Pixel,
-            visible: true,
-            opacity: 1.0,
-            blend_mode: "norm".to_string(),
-            bounds: Bounds {
-                x: 10,
-                y: 20,
-                width: 1,
-                height: 1,
-            },
-            children: Vec::new(),
-            image: Some(RgbaBitmap {
-                width: 1,
-                height: 1,
-                pixels: vec![255, 255, 255, 255],
-            }),
-            mask: None,
-            text: None,
-            effects: LayerEffects::default(),
-            unsupported: Vec::new(),
-            is_clipped: false,
-            id: "layer_test".to_string(),
-            stack_index: 0,
-            clip_to: None,
-            path_indices: vec![0],
-            external_asset: None,
-        }
-    }
-
-    fn sample_flat_layer(name: &str, layer_type: LayerType) -> FlatLayer {
-        FlatLayer {
-            raw_index: 0,
-            name: name.to_string(),
-            layer_type,
-            visible: true,
-            opacity: 1.0,
-            blend_mode: "norm".to_string(),
-            bounds: Bounds {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-            },
-            group_opener: false,
-            group_closer: false,
-            is_clipped: false,
-            image: None,
-            mask: None,
-            text: None,
-            effects: LayerEffects::default(),
-            unsupported: Vec::new(),
-        }
-    }
-
-    fn group_layer(name: &str) -> FlatLayer {
-        let mut layer = sample_flat_layer(name, LayerType::Group);
-        layer.bounds.width = 0;
-        layer.bounds.height = 0;
-        layer.group_opener = true;
-        layer
-    }
-
-    fn synthetic_group_closer_layer() -> FlatLayer {
-        let mut layer = sample_flat_layer("</Layer group>", LayerType::Unknown);
-        layer.bounds.width = 0;
-        layer.bounds.height = 0;
-        layer
-    }
-
-    fn synthetic_group_opener_candidate(name: &str) -> FlatLayer {
-        let mut layer = sample_flat_layer(name, LayerType::Unknown);
-        layer.bounds.width = 0;
-        layer.bounds.height = 0;
-        layer
-    }
-}
