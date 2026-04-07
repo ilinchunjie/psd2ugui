@@ -77,6 +77,8 @@ struct PreviewOverride {
 struct ReconstructionResult {
     nodes: Vec<BuildNode>,
     synthetic_opener_count: usize,
+    orphan_opener_count: usize,
+    orphan_closer_count: usize,
 }
 
 pub fn export_psd_file(input: &Path, options: ExportOptions) -> Result<ExportManifest> {
@@ -220,12 +222,16 @@ fn build_layer_tree(
         Ok(result) => {
             push_synthetic_group_closer_warning(synthetic_closer_count, warnings);
             push_synthetic_group_opener_warning(result.synthetic_opener_count, warnings);
+            push_orphan_group_opener_warning(result.orphan_opener_count, warnings);
+            push_orphan_group_closer_warning(result.orphan_closer_count, warnings);
             Ok(result.nodes)
         }
         Err(primary_error) => match reconstruct_bottom_up(layers.into_iter().rev().collect()) {
             Ok(result) => {
                 push_synthetic_group_closer_warning(synthetic_closer_count, warnings);
                 push_synthetic_group_opener_warning(result.synthetic_opener_count, warnings);
+                push_orphan_group_opener_warning(result.orphan_opener_count, warnings);
+                push_orphan_group_closer_warning(result.orphan_closer_count, warnings);
                 warnings.push(ExportWarning::new(
                     "layer-order-fallback",
                     format!(
@@ -273,6 +279,38 @@ fn push_synthetic_group_opener_warning(
     ));
 }
 
+fn push_orphan_group_opener_warning(
+    orphan_opener_count: usize,
+    warnings: &mut Vec<ExportWarning>,
+) {
+    if orphan_opener_count == 0 {
+        return;
+    }
+
+    warnings.push(ExportWarning::new(
+        "orphan-group-opener",
+        format!(
+            "recovered {orphan_opener_count} group opener layer(s) that had no matching closer; treated as childless group(s)"
+        ),
+    ));
+}
+
+fn push_orphan_group_closer_warning(
+    orphan_closer_count: usize,
+    warnings: &mut Vec<ExportWarning>,
+) {
+    if orphan_closer_count == 0 {
+        return;
+    }
+
+    warnings.push(ExportWarning::new(
+        "orphan-group-closer",
+        format!(
+            "recovered {orphan_closer_count} group closer layer(s) that had no matching opener; their children were promoted to the parent level"
+        ),
+    ));
+}
+
 fn is_synthetic_group_closer(layer: &FlatLayer) -> bool {
     !layer.group_opener
         && !layer.group_closer
@@ -297,6 +335,7 @@ fn reconstruct_bottom_up(
     let mut future_opener_counts = vec![0isize; layers.len() + 1];
     let mut future_candidate_opener_counts = vec![0isize; layers.len() + 1];
     let mut synthetic_opener_count = 0usize;
+    let mut orphan_opener_count = 0usize;
 
     for index in (0..layers.len()).rev() {
         let layer = &layers[index];
@@ -339,10 +378,19 @@ fn reconstruct_bottom_up(
 
         if effective_opener {
             if stack.len() == 1 {
-                return Err(format!(
-                    "group opener '{}' had no matching closer",
-                    layer.name
-                ));
+                // Orphan opener: no matching closer was found.
+                // Treat it as a childless group and continue.
+                let mut node = BuildNode::from_flat_layer(layer);
+                if synthetic_opener_candidate {
+                    synthetic_opener_count += 1;
+                    node.layer_type = LayerType::Group;
+                }
+                orphan_opener_count += 1;
+                stack
+                    .last_mut()
+                    .ok_or_else(|| "layer stack missing".to_string())?
+                    .push(node);
+                continue;
             }
 
             let children = stack
@@ -367,13 +415,22 @@ fn reconstruct_bottom_up(
             .push(BuildNode::from_flat_layer(layer));
     }
 
-    if stack.len() != 1 {
-        return Err("unbalanced group markers remained after reconstruction".to_string());
+    // Collapse any remaining orphan stack frames (from closers without matching openers)
+    // by merging their contents into the root level.
+    let orphan_closer_count = stack.len().saturating_sub(1);
+    while stack.len() > 1 {
+        let orphan_frame = stack.pop().unwrap();
+        stack
+            .last_mut()
+            .unwrap()
+            .extend(orphan_frame);
     }
 
     Ok(ReconstructionResult {
         nodes: stack.pop().unwrap().into_iter().rev().collect(),
         synthetic_opener_count,
+        orphan_opener_count,
+        orphan_closer_count,
     })
 }
 
@@ -1441,17 +1498,50 @@ mod tests {
     }
 
     #[test]
-    fn still_fails_when_hierarchy_remains_unbalanced() {
-        let error = build_layer_tree(
+    fn orphan_opener_is_treated_as_childless_group() {
+        let mut warnings = Vec::new();
+        let nodes = build_layer_tree(
             vec![sample_flat_layer("Pixel", LayerType::Pixel), group_layer("Group")],
-            &mut Vec::new(),
+            &mut warnings,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(matches!(error, AppError::Manifest(_)));
-        assert!(error
-            .to_string()
-            .contains("group opener 'Group' had no matching closer"));
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].name, "Group");
+        assert!(matches!(nodes[0].layer_type, LayerType::Group));
+        assert!(nodes[0].children.is_empty());
+        assert_eq!(nodes[1].name, "Pixel");
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.code == "orphan-group-opener")
+        );
+    }
+
+    #[test]
+    fn orphan_opener_among_valid_groups_still_works() {
+        let mut warnings = Vec::new();
+        let nodes = build_layer_tree(
+            vec![
+                synthetic_group_closer_layer(),
+                sample_flat_layer("Child", LayerType::Pixel),
+                group_layer("ValidGroup"),
+                group_layer("OrphanGroup"),
+            ],
+            &mut warnings,
+        )
+        .unwrap();
+
+        // OrphanGroup has no closer, so it's childless; ValidGroup has Child
+        let orphan = nodes.iter().find(|n| n.name == "OrphanGroup").unwrap();
+        assert!(orphan.children.is_empty());
+        let valid = nodes.iter().find(|n| n.name == "ValidGroup").unwrap();
+        assert_eq!(valid.children.len(), 1);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.code == "orphan-group-opener")
+        );
     }
 
     #[test]

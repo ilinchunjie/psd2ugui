@@ -319,6 +319,8 @@ fn merge_layer(raw_index: usize, raw_layer: LayerInfo, scan: LayerScanEntry) -> 
         LayerType::Text
     } else if scan.shape_detected {
         LayerType::Shape
+    } else if !raw_layer.adjustment_type.is_empty() {
+        LayerType::Unknown
     } else if raw_layer.w > 0 && raw_layer.h > 0 {
         LayerType::Pixel
     } else {

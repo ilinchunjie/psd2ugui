@@ -77,19 +77,47 @@ pub fn run_photoshop_export(
 
     let request_json = serde_json::to_vec_pretty(request)?;
     fs::write(&request_path, request_json).map_err(|error| AppError::io(&request_path, error))?;
+
+    // Photoshop's ExtendScript resolves File() paths relative to its own
+    // working directory, which is NOT the cwd of cscript.exe.  Canonicalize
+    // all paths embedded in the JSX so they are always absolute.
+    let abs_request_path = fs::canonicalize(&request_path)
+        .map_err(|error| AppError::io(&request_path, error))?;
+    let abs_response_path = runtime_dir
+        .canonicalize()
+        .map_err(|error| AppError::io(&runtime_dir, error))?
+        .join("response.json");
+    let staging_path = Path::new(&request.staging_dir);
+    let abs_staging_dir = if staging_path.exists() {
+        fs::canonicalize(staging_path)
+            .map_err(|error| AppError::io(staging_path, error))?
+    } else {
+        fs::create_dir_all(staging_path)
+            .map_err(|error| AppError::io(staging_path, error))?;
+        fs::canonicalize(staging_path)
+            .map_err(|error| AppError::io(staging_path, error))?
+    };
+
     fs::write(
         &jsx_path,
-        build_jsx_script(&request_path, &response_path, request),
+        build_jsx_script(&abs_request_path, &abs_response_path, &abs_staging_dir, request),
     )
     .map_err(|error| AppError::io(&jsx_path, error))?;
     fs::write(&js_driver_path, windows_script_driver())
         .map_err(|error| AppError::io(&js_driver_path, error))?;
 
+    // Canonicalize the driver and JSX paths so that Photoshop's
+    // DoJavaScriptFile receives an absolute path via the cscript argument.
+    let abs_jsx_path = fs::canonicalize(&jsx_path)
+        .map_err(|error| AppError::io(&jsx_path, error))?;
+    let abs_driver_path = fs::canonicalize(&js_driver_path)
+        .map_err(|error| AppError::io(&js_driver_path, error))?;
+
     let mut command = Command::new("cscript.exe");
     command
         .arg("//NoLogo")
-        .arg(&js_driver_path)
-        .arg(&jsx_path)
+        .arg(&abs_driver_path)
+        .arg(&abs_jsx_path)
         .arg(options.timeout_sec.to_string());
 
     if let Some(photoshop_exe) = &options.photoshop_exe {
@@ -176,6 +204,7 @@ try {
 fn build_jsx_script(
     request_path: &Path,
     response_path: &Path,
+    staging_dir: &Path,
     request: &PhotoshopExportRequest,
 ) -> String {
     format!(
@@ -183,6 +212,12 @@ fn build_jsx_script(
 var REQUEST_PATH = "{request_path}";
 var RESPONSE_PATH = "{response_path}";
 var STAGING_DIR = "{staging_dir}";
+"#,
+        request_path = js_path(request_path),
+        response_path = js_path(response_path),
+        staging_dir = js_path(staging_dir),
+    ) + &format!(
+        r#"
 
 function readText(path) {{
     var file = new File(path);
@@ -297,6 +332,45 @@ function resolveLayerByPath(documentRef, pathIndices) {{
         }}
     }}
     return current;
+}}
+
+function flattenLayersBottomUp(container) {{
+    var result = [];
+    var layers = layerCollection(container);
+    for (var i = layers.length - 1; i >= 0; i--) {{
+        var layer = layers[i];
+        if (layer.typename === "LayerSet") {{
+            result.push(null);
+            var children = flattenLayersBottomUp(layer);
+            for (var j = 0; j < children.length; j++) {{
+                result.push(children[j]);
+            }}
+            result.push(layer);
+        }} else {{
+            result.push(layer);
+        }}
+    }}
+    return result;
+}}
+
+var flatLayerMap = null;
+
+function buildFlatLayerMap(documentRef) {{
+    flatLayerMap = flattenLayersBottomUp(documentRef);
+}}
+
+function resolveLayer(documentRef, pathIndices, rawIndex) {{
+    try {{
+        return resolveLayerByPath(documentRef, pathIndices);
+    }} catch (pathError) {{
+        if (flatLayerMap && rawIndex !== undefined && rawIndex !== null && rawIndex < flatLayerMap.length) {{
+            var layer = flatLayerMap[rawIndex];
+            if (layer) {{
+                return layer;
+            }}
+        }}
+        throw pathError;
+    }}
 }}
 
 function hideAllLayers(container) {{
@@ -440,7 +514,7 @@ function exportLayer(sourceDoc, layerRequest) {{
     var exportDoc = null;
 
     try {{
-        var targetLayer = resolveLayerByPath(sourceDoc, layerRequest.path_indices);
+        var targetLayer = resolveLayer(sourceDoc, layerRequest.path_indices, layerRequest.raw_index);
         layerBounds = collectBounds(targetLayer);
         if (layerBounds.width <= 0 || layerBounds.height <= 0) {{
             result.warnings.push("layer bounds were empty");
@@ -488,6 +562,7 @@ var sourceDoc = null;
 try {{
     app.displayDialogs = DialogModes.NO;
     sourceDoc = app.open(new File(request.source_psd_path));
+    buildFlatLayerMap(sourceDoc);
     exportPreview(sourceDoc, response);
     for (var layerIndex = 0; layerIndex < request.layers.length; layerIndex++) {{
         response.layers.push(exportLayer(sourceDoc, request.layers[layerIndex]));
@@ -501,15 +576,16 @@ try {{
     writeText(RESPONSE_PATH, toJson(response));
 }}
 "#,
-        request_path = js_path(request_path),
-        response_path = js_path(response_path),
-        staging_dir = js_path(Path::new(&request.staging_dir)),
         preview_relpath = request.preview_relpath.replace('\\', "/"),
     )
 }
 
 fn js_path(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace('\\', "\\\\")
+    let raw = path.to_string_lossy();
+    // fs::canonicalize on Windows produces \\?\ extended-length paths.
+    // Photoshop ExtendScript's File() cannot parse that prefix, so strip it.
+    let clean = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    // ExtendScript File() expects forward slashes.
+    clean.replace('\\', "/")
         .replace('"', "\\\"")
 }
