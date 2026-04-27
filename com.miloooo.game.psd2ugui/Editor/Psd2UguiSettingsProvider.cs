@@ -37,10 +37,9 @@ namespace PsdUi.Editor
                 "Unity Import Root",
                 projectSettings.UnityImportRoot);
 
-            var photoshopExePath = DrawFileField(
-                "Photoshop Executable",
-                userSettings.PhotoshopExePath,
-                "exe");
+            var photoshopPath = DrawPhotoshopPathField(
+                "Photoshop Application",
+                userSettings.PhotoshopExePath);
 
             EditorGUILayout.Space();
             EditorGUILayout.LabelField("Import Defaults", EditorStyles.boldLabel);
@@ -52,7 +51,7 @@ namespace PsdUi.Editor
             {
                 projectSettings.CacheDirectory = cacheDirectory;
                 projectSettings.UnityImportRoot = importRoot;
-                userSettings.PhotoshopExePath = photoshopExePath;
+                userSettings.PhotoshopExePath = photoshopPath;
                 serializedProjectSettings.ApplyModifiedPropertiesWithoutUndo();
                 projectSettings.SaveSettings();
                 userSettings.SaveSettings();
@@ -149,10 +148,9 @@ namespace PsdUi.Editor
             return newValue;
         }
 
-        private static string DrawFileField(
+        private static string DrawPhotoshopPathField(
             string label,
-            string currentValue,
-            string extension)
+            string currentValue)
         {
             EditorGUILayout.BeginHorizontal();
             var newValue = EditorGUILayout.TextField(label, currentValue);
@@ -161,7 +159,17 @@ namespace PsdUi.Editor
                 var startDirectory = string.IsNullOrWhiteSpace(currentValue)
                     ? Psd2UguiPackageInfo.ProjectRootFileSystemPath
                     : Path.GetDirectoryName(currentValue) ?? Psd2UguiPackageInfo.ProjectRootFileSystemPath;
-                var selected = EditorUtility.OpenFilePanel(label, startDirectory, extension);
+
+                string selected;
+                if (Psd2UguiPackageInfo.IsMacOsEditor)
+                {
+                    selected = EditorUtility.OpenFolderPanel(label, startDirectory, string.Empty);
+                }
+                else
+                {
+                    selected = EditorUtility.OpenFilePanel(label, startDirectory, "exe");
+                }
+
                 if (!string.IsNullOrWhiteSpace(selected))
                 {
                     newValue = selected;

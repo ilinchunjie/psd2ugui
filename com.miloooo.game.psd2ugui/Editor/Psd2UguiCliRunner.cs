@@ -24,7 +24,7 @@ namespace PsdUi.Editor
         {
             public string PsdPath { get; set; } = string.Empty;
             public string CacheDirectory { get; set; } = string.Empty;
-            public string PhotoshopExePath { get; set; } = string.Empty;
+            public string PhotoshopPath { get; set; } = string.Empty;
         }
 
         public sealed class PipelineResult
@@ -60,13 +60,13 @@ namespace PsdUi.Editor
         }
 
         private static IProcessRunner processRunner = new SystemProcessRunner();
-        private static Func<string> executablePathResolver = Psd2UguiPackageInfo.GetWindowsExecutableFileSystemPath;
+        private static Func<string> executablePathResolver = Psd2UguiPackageInfo.GetEmbeddedExecutableFileSystemPath;
 
         public static PipelineResult RunPipeline(PipelineOptions options)
         {
-            if (!Psd2UguiPackageInfo.IsWindowsEditor)
+            if (!Psd2UguiPackageInfo.IsSupportedEditorPlatform)
             {
-                throw new InvalidOperationException("The embedded PSD2UGUI executable is only supported on Windows Unity Editor.");
+                throw new InvalidOperationException(Psd2UguiPackageInfo.GetUnsupportedEditorMessage());
             }
 
             if (options == null)
@@ -77,8 +77,10 @@ namespace PsdUi.Editor
             var executablePath = executablePathResolver();
             if (!File.Exists(executablePath))
             {
-                throw new FileNotFoundException("Embedded psd2ugui.exe was not found.", executablePath);
+                throw new FileNotFoundException("Embedded PSD2UGUI executable was not found.", executablePath);
             }
+
+            EnsureExecutableIsRunnable(executablePath);
 
             var startInfo = new ProcessStartInfo
             {
@@ -95,7 +97,7 @@ namespace PsdUi.Editor
             if (result.ExitCode != 0)
             {
                 throw new InvalidOperationException(
-                    $"psd2ugui.exe exited with code {result.ExitCode}.{Environment.NewLine}" +
+                    $"psd2ugui exited with code {result.ExitCode}.{Environment.NewLine}" +
                     $"stdout: {result.StandardOutput}{Environment.NewLine}" +
                     $"stderr: {result.StandardError}");
             }
@@ -108,7 +110,7 @@ namespace PsdUi.Editor
                 string.IsNullOrWhiteSpace(payload.DocumentId))
             {
                 throw new InvalidOperationException(
-                    $"psd2ugui.exe returned invalid JSON payload:{Environment.NewLine}{result.StandardOutput}");
+                    $"psd2ugui returned invalid JSON payload:{Environment.NewLine}{result.StandardOutput}");
             }
 
             return payload;
@@ -121,13 +123,13 @@ namespace PsdUi.Editor
 
         internal static void SetExecutablePathResolverForTests(Func<string> resolver)
         {
-            executablePathResolver = resolver ?? Psd2UguiPackageInfo.GetWindowsExecutableFileSystemPath;
+            executablePathResolver = resolver ?? Psd2UguiPackageInfo.GetEmbeddedExecutableFileSystemPath;
         }
 
         internal static void ResetProcessRunnerForTests()
         {
             processRunner = new SystemProcessRunner();
-            executablePathResolver = Psd2UguiPackageInfo.GetWindowsExecutableFileSystemPath;
+            executablePathResolver = Psd2UguiPackageInfo.GetEmbeddedExecutableFileSystemPath;
         }
 
         private static string BuildPipelineArguments(PipelineOptions options)
@@ -138,13 +140,39 @@ namespace PsdUi.Editor
                 options.PsdPath,
                 "--cache-dir",
                 options.CacheDirectory,
-                "--raster-backend",
-                "auto",
-                "--photoshop-exe",
-                options.PhotoshopExePath
+                "--photoshop-path",
+                options.PhotoshopPath
             };
 
             return string.Join(" ", arguments.ConvertAll(QuoteArgument));
+        }
+
+        private static void EnsureExecutableIsRunnable(string executablePath)
+        {
+            if (!Psd2UguiPackageInfo.IsMacOsEditor)
+            {
+                return;
+            }
+
+            var chmodInfo = new ProcessStartInfo
+            {
+                FileName = "/bin/chmod",
+                Arguments = $"755 {QuoteArgument(executablePath)}",
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                WorkingDirectory = Psd2UguiPackageInfo.ProjectRootFileSystemPath
+            };
+
+            var result = processRunner.Run(chmodInfo);
+            if (result.ExitCode != 0)
+            {
+                throw new InvalidOperationException(
+                    $"Failed to mark embedded PSD2UGUI executable as runnable on macOS: {executablePath}.{Environment.NewLine}" +
+                    $"stdout: {result.StandardOutput}{Environment.NewLine}" +
+                    $"stderr: {result.StandardError}");
+            }
         }
 
         private static string QuoteArgument(string value)

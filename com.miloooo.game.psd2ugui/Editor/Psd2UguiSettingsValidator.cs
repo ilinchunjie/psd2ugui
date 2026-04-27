@@ -96,20 +96,37 @@ namespace PsdUi.Editor
             return true;
         }
 
-        internal static bool TryValidatePhotoshopExecutable(
-            string photoshopExePath,
+        internal static bool TryValidatePhotoshopApplication(
+            string photoshopPath,
             out string error)
         {
-            if (string.IsNullOrWhiteSpace(photoshopExePath))
+            if (string.IsNullOrWhiteSpace(photoshopPath))
             {
-                error = "Photoshop executable path must not be empty.";
+                error = "Photoshop application path must not be empty.";
                 return false;
             }
 
-            if (!File.Exists(photoshopExePath))
+            if (Psd2UguiPackageInfo.IsMacOsEditor)
             {
-                error = $"Photoshop executable does not exist: {photoshopExePath}";
-                return false;
+                if (!Directory.Exists(photoshopPath))
+                {
+                    error = $"Photoshop application does not exist: {photoshopPath}";
+                    return false;
+                }
+
+                if (!string.Equals(Path.GetExtension(photoshopPath), ".app", StringComparison.OrdinalIgnoreCase))
+                {
+                    error = $"Photoshop application must be a .app bundle on macOS: {photoshopPath}";
+                    return false;
+                }
+            }
+            else
+            {
+                if (!File.Exists(photoshopPath))
+                {
+                    error = $"Photoshop executable does not exist: {photoshopPath}";
+                    return false;
+                }
             }
 
             error = string.Empty;
@@ -135,9 +152,9 @@ namespace PsdUi.Editor
             Psd2UguiUserSettings userSettings,
             out string error)
         {
-            if (!Psd2UguiPackageInfo.IsWindowsEditor)
+            if (!Psd2UguiPackageInfo.IsSupportedEditorPlatform)
             {
-                error = "Import PSD is only supported on Windows Unity Editor.";
+                error = Psd2UguiPackageInfo.GetUnsupportedEditorMessage();
                 return false;
             }
 
@@ -156,7 +173,7 @@ namespace PsdUi.Editor
                 return false;
             }
 
-            if (!TryValidatePhotoshopExecutable(userSettings.PhotoshopExePath, out error))
+            if (!TryValidatePhotoshopApplication(userSettings.PhotoshopExePath, out error))
             {
                 return false;
             }

@@ -40,7 +40,7 @@ namespace PsdUi.Editor
             {
                 PsdPath = psdPath,
                 CacheDirectory = projectSettings.CacheDirectory,
-                PhotoshopExePath = userSettings.PhotoshopExePath
+                PhotoshopPath = userSettings.PhotoshopExePath
             });
 
             var prefabPath = BundleImporter(pipeline.BundleDir, projectSettings.UnityImportRoot);

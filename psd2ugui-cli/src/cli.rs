@@ -65,8 +65,8 @@ pub struct ExportCommandArgs {
     pub include_hidden: bool,
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub strict: bool,
-    #[arg(long)]
-    pub photoshop_exe: Option<PathBuf>,
+    #[arg(long, visible_alias = "photoshop-exe")]
+    pub photoshop_path: Option<PathBuf>,
     #[arg(long, default_value_t = 120)]
     pub photoshop_timeout_sec: u64,
 }
@@ -92,8 +92,8 @@ pub struct PipelineCommandArgs {
     pub include_hidden: bool,
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub strict: bool,
-    #[arg(long)]
-    pub photoshop_exe: Option<PathBuf>,
+    #[arg(long, visible_alias = "photoshop-exe")]
+    pub photoshop_path: Option<PathBuf>,
     #[arg(long, default_value_t = 120)]
     pub photoshop_timeout_sec: u64,
 }
@@ -152,7 +152,7 @@ pub fn run_export(args: &ExportCommandArgs) -> CliResult<()> {
             include_hidden: args.include_hidden,
             with_preview: args.with_preview,
             strict: args.strict,
-            photoshop_exe: args.photoshop_exe.clone(),
+            photoshop_path: args.photoshop_path.clone(),
             photoshop_timeout_sec: args.photoshop_timeout_sec,
         },
     )?;
@@ -198,7 +198,7 @@ pub fn run_pipeline(args: &PipelineCommandArgs) -> CliResult<PipelineResult> {
             include_hidden: args.include_hidden,
             with_preview: true,
             strict: args.strict,
-            photoshop_exe: args.photoshop_exe.clone(),
+            photoshop_path: args.photoshop_path.clone(),
             photoshop_timeout_sec: args.photoshop_timeout_sec,
         },
     )?;

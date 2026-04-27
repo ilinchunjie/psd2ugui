@@ -20,7 +20,7 @@ pub struct ExportOptions {
     pub include_hidden: bool,
     pub with_preview: bool,
     pub strict: bool,
-    pub photoshop_exe: Option<PathBuf>,
+    pub photoshop_path: Option<PathBuf>,
     pub photoshop_timeout_sec: u64,
 }
 
@@ -161,7 +161,7 @@ fn rasterize_with_photoshop(
     let response = photoshop::run_photoshop_export(
         &request,
         &PhotoshopExportOptions {
-            photoshop_exe: options.photoshop_exe.clone(),
+            photoshop_path: options.photoshop_path.clone(),
             timeout_sec: options.photoshop_timeout_sec,
         },
         &options.out_dir,
@@ -606,7 +606,7 @@ fn apply_photoshop_result_to_node(
         )));
     };
 
-    let staged_path = staging_dir.join(request.output_png_relpath.replace('/', "\\"));
+    let staged_path = join_relative_forward_slash_path(staging_dir, &request.output_png_relpath);
     if !staged_path.exists() {
         return Err(AppError::Photoshop(format!(
             "failed to rasterize layer '{}' via Photoshop: staged PNG is missing: {}",
@@ -647,7 +647,7 @@ fn preview_override_from_response(
         return Ok(None);
     };
 
-    let staged_path = staging_dir.join(preview_path.replace('/', "\\"));
+    let staged_path = join_relative_forward_slash_path(staging_dir, &preview_path);
     if !staged_path.exists() {
         warnings.push(ExportWarning::new(
             "photoshop-preview-missing",
@@ -699,7 +699,7 @@ fn write_single_node(
 ) -> Result<LayerNode> {
     let asset = if should_export_image(node, include_hidden) {
         if let Some(asset) = &node.external_asset {
-            let full_path = out_dir.join(asset.relative_path.replace('/', "\\"));
+            let full_path = join_relative_forward_slash_path(out_dir, &asset.relative_path);
             copy_staged_asset(&asset.staged_path, &full_path)?;
             Some(AssetRef {
                 path: asset.relative_path.clone(),
@@ -765,6 +765,13 @@ fn copy_staged_asset(source: &Path, destination: &Path) -> Result<()> {
         ))
     })?;
     Ok(())
+}
+
+fn join_relative_forward_slash_path(base: &Path, relative_path: &str) -> PathBuf {
+    relative_path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .fold(base.to_path_buf(), |path, segment| path.join(segment))
 }
 
 fn generate_node_id(path: &[usize], raw_index: usize) -> String {
@@ -854,6 +861,18 @@ impl BuildNode {
             path_indices: Vec::new(),
             external_asset: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::join_relative_forward_slash_path;
+    use std::path::Path;
+
+    #[test]
+    fn joins_forward_slash_relative_paths_portably() {
+        let joined = join_relative_forward_slash_path(Path::new("base"), "preview/document.png");
+        assert_eq!(joined, Path::new("base").join("preview").join("document.png"));
     }
 }
 

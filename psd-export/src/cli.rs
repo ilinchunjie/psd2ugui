@@ -32,8 +32,8 @@ struct ExportArgs {
     include_hidden: bool,
     #[arg(long, action = clap::ArgAction::SetTrue)]
     strict: bool,
-    #[arg(long)]
-    photoshop_exe: Option<PathBuf>,
+    #[arg(long, visible_alias = "photoshop-exe")]
+    photoshop_path: Option<PathBuf>,
     #[arg(long, default_value_t = 120)]
     photoshop_timeout_sec: u64,
 }
@@ -52,7 +52,7 @@ pub fn run() -> Result<()> {
                     include_hidden: args.include_hidden,
                     with_preview: true,
                     strict: args.strict,
-                    photoshop_exe: args.photoshop_exe,
+                    photoshop_path: args.photoshop_path,
                     photoshop_timeout_sec: args.photoshop_timeout_sec,
                 },
             )?;

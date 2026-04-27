@@ -10,7 +10,7 @@ namespace PsdUi.Editor
         [MenuItem("美术/PSD2UGUI/Import PSD...", true)]
         private static bool CanImportPsdViaDialog()
         {
-            return Psd2UguiPackageInfo.IsWindowsEditor;
+            return Psd2UguiPackageInfo.IsSupportedEditorPlatform;
         }
 
         [MenuItem("美术/PSD2UGUI/Import PSD...")]

@@ -55,8 +55,22 @@ pub struct PhotoshopLayerExportResult {
 
 #[derive(Debug, Clone)]
 pub struct PhotoshopExportOptions {
-    pub photoshop_exe: Option<PathBuf>,
+    pub photoshop_path: Option<PathBuf>,
     pub timeout_sec: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedRuntime {
+    runtime_dir: PathBuf,
+    response_path: PathBuf,
+    jsx_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostPlatform {
+    Windows,
+    MacOs,
+    Unsupported,
 }
 
 pub fn run_photoshop_export(
@@ -64,6 +78,29 @@ pub fn run_photoshop_export(
     options: &PhotoshopExportOptions,
     workspace_root: &Path,
 ) -> Result<PhotoshopExportResponse> {
+    let runtime = prepare_runtime(request, workspace_root)?;
+
+    match detect_host_platform() {
+        HostPlatform::Windows => run_windows_driver(&runtime, options)?,
+        HostPlatform::MacOs => run_macos_driver(&runtime, options)?,
+        HostPlatform::Unsupported => {
+            return Err(AppError::Photoshop(
+                "Photoshop export is only supported on Windows and macOS hosts.".to_string(),
+            ));
+        }
+    }
+
+    let response_json =
+        fs::read_to_string(&runtime.response_path).map_err(|error| AppError::io(&runtime.response_path, error))?;
+    serde_json::from_str(&response_json).map_err(|error| {
+        AppError::Photoshop(format!(
+            "failed to parse Photoshop export response {}: {error}",
+            runtime.response_path.display()
+        ))
+    })
+}
+
+fn prepare_runtime(request: &PhotoshopExportRequest, workspace_root: &Path) -> Result<PreparedRuntime> {
     let runtime_dir = workspace_root.join(".photoshop-runtime");
     if runtime_dir.exists() {
         fs::remove_dir_all(&runtime_dir).map_err(|error| AppError::io(&runtime_dir, error))?;
@@ -73,29 +110,20 @@ pub fn run_photoshop_export(
     let request_path = runtime_dir.join("request.json");
     let response_path = runtime_dir.join("response.json");
     let jsx_path = runtime_dir.join("export_layers.jsx");
-    let js_driver_path = runtime_dir.join("run_photoshop_export.js");
 
     let request_json = serde_json::to_vec_pretty(request)?;
     fs::write(&request_path, request_json).map_err(|error| AppError::io(&request_path, error))?;
 
-    // Photoshop's ExtendScript resolves File() paths relative to its own
-    // working directory, which is NOT the cwd of cscript.exe.  Canonicalize
-    // all paths embedded in the JSX so they are always absolute.
-    let abs_request_path = fs::canonicalize(&request_path)
-        .map_err(|error| AppError::io(&request_path, error))?;
-    let abs_response_path = runtime_dir
-        .canonicalize()
-        .map_err(|error| AppError::io(&runtime_dir, error))?
-        .join("response.json");
+    let abs_request_path = fs::canonicalize(&request_path).map_err(|error| AppError::io(&request_path, error))?;
+    let abs_runtime_dir = fs::canonicalize(&runtime_dir).map_err(|error| AppError::io(&runtime_dir, error))?;
+    let abs_response_path = abs_runtime_dir.join("response.json");
+
     let staging_path = Path::new(&request.staging_dir);
     let abs_staging_dir = if staging_path.exists() {
-        fs::canonicalize(staging_path)
-            .map_err(|error| AppError::io(staging_path, error))?
+        fs::canonicalize(staging_path).map_err(|error| AppError::io(staging_path, error))?
     } else {
-        fs::create_dir_all(staging_path)
-            .map_err(|error| AppError::io(staging_path, error))?;
-        fs::canonicalize(staging_path)
-            .map_err(|error| AppError::io(staging_path, error))?
+        fs::create_dir_all(staging_path).map_err(|error| AppError::io(staging_path, error))?;
+        fs::canonicalize(staging_path).map_err(|error| AppError::io(staging_path, error))?
     };
 
     fs::write(
@@ -103,15 +131,20 @@ pub fn run_photoshop_export(
         build_jsx_script(&abs_request_path, &abs_response_path, &abs_staging_dir, request),
     )
     .map_err(|error| AppError::io(&jsx_path, error))?;
-    fs::write(&js_driver_path, windows_script_driver())
-        .map_err(|error| AppError::io(&js_driver_path, error))?;
 
-    // Canonicalize the driver and JSX paths so that Photoshop's
-    // DoJavaScriptFile receives an absolute path via the cscript argument.
-    let abs_jsx_path = fs::canonicalize(&jsx_path)
-        .map_err(|error| AppError::io(&jsx_path, error))?;
-    let abs_driver_path = fs::canonicalize(&js_driver_path)
-        .map_err(|error| AppError::io(&js_driver_path, error))?;
+    Ok(PreparedRuntime {
+        runtime_dir,
+        response_path,
+        jsx_path,
+    })
+}
+
+fn run_windows_driver(runtime: &PreparedRuntime, options: &PhotoshopExportOptions) -> Result<()> {
+    let driver_path = runtime.runtime_dir.join("run_photoshop_export.js");
+    fs::write(&driver_path, windows_script_driver()).map_err(|error| AppError::io(&driver_path, error))?;
+
+    let abs_jsx_path = fs::canonicalize(&runtime.jsx_path).map_err(|error| AppError::io(&runtime.jsx_path, error))?;
+    let abs_driver_path = fs::canonicalize(&driver_path).map_err(|error| AppError::io(&driver_path, error))?;
 
     let mut command = Command::new("cscript.exe");
     command
@@ -120,8 +153,10 @@ pub fn run_photoshop_export(
         .arg(&abs_jsx_path)
         .arg(options.timeout_sec.to_string());
 
-    if let Some(photoshop_exe) = &options.photoshop_exe {
-        command.arg(photoshop_exe);
+    if let Some(photoshop_path) = options.photoshop_path.as_ref().filter(|path| !path.as_os_str().is_empty()) {
+        let canonical_path =
+            validate_windows_photoshop_path(photoshop_path).and_then(|path| canonicalize_existing_path(&path))?;
+        command.arg(canonical_path);
     }
 
     let output = command.output().map_err(|error| {
@@ -129,6 +164,7 @@ pub fn run_photoshop_export(
             "failed to launch Windows Script Host Photoshop driver: {error}"
         ))
     })?;
+
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -140,14 +176,86 @@ pub fn run_photoshop_export(
         )));
     }
 
-    let response_json =
-        fs::read_to_string(&response_path).map_err(|error| AppError::io(&response_path, error))?;
-    serde_json::from_str(&response_json).map_err(|error| {
-        AppError::Photoshop(format!(
-            "failed to parse Photoshop export response {}: {error}",
-            response_path.display()
-        ))
-    })
+    Ok(())
+}
+
+fn run_macos_driver(runtime: &PreparedRuntime, options: &PhotoshopExportOptions) -> Result<()> {
+    let driver_path = runtime.runtime_dir.join("run_photoshop_export.applescript");
+    fs::write(&driver_path, macos_script_driver()).map_err(|error| AppError::io(&driver_path, error))?;
+
+    let abs_jsx_path = fs::canonicalize(&runtime.jsx_path).map_err(|error| AppError::io(&runtime.jsx_path, error))?;
+    let mut command = Command::new("osascript");
+    command
+        .arg(&driver_path)
+        .arg(&abs_jsx_path)
+        .arg(options.timeout_sec.to_string());
+
+    if let Some(photoshop_path) = options.photoshop_path.as_ref().filter(|path| !path.as_os_str().is_empty()) {
+        let canonical_path =
+            validate_macos_photoshop_path(photoshop_path).and_then(|path| canonicalize_existing_path(&path))?;
+        command.arg(canonical_path);
+    }
+
+    let output = command.output().map_err(|error| {
+        AppError::Photoshop(format!("failed to launch macOS Photoshop automation driver: {error}"))
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(AppError::Photoshop(map_macos_driver_failure(
+            stdout.trim(),
+            stderr.trim(),
+        )));
+    }
+
+    Ok(())
+}
+
+fn detect_host_platform() -> HostPlatform {
+    host_platform_from(std::env::consts::OS)
+}
+
+fn host_platform_from(host_os: &str) -> HostPlatform {
+    match host_os {
+        "windows" => HostPlatform::Windows,
+        "macos" => HostPlatform::MacOs,
+        _ => HostPlatform::Unsupported,
+    }
+}
+
+fn validate_windows_photoshop_path(path: &Path) -> Result<PathBuf> {
+    if !path.exists() {
+        return Err(AppError::Photoshop(format!(
+            "Photoshop executable does not exist: {}",
+            path.display()
+        )));
+    }
+
+    Ok(path.to_path_buf())
+}
+
+fn validate_macos_photoshop_path(path: &Path) -> Result<PathBuf> {
+    if !path.exists() {
+        return Err(AppError::Photoshop(format!(
+            "Photoshop application does not exist: {}",
+            path.display()
+        )));
+    }
+
+    let extension = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
+    if !extension.eq_ignore_ascii_case("app") {
+        return Err(AppError::Photoshop(format!(
+            "Photoshop application must be a .app bundle on macOS: {}",
+            path.display()
+        )));
+    }
+
+    Ok(path.to_path_buf())
+}
+
+fn canonicalize_existing_path(path: &Path) -> Result<PathBuf> {
+    fs::canonicalize(path).map_err(|error| AppError::io(path, error))
 }
 
 fn windows_script_driver() -> &'static str {
@@ -159,7 +267,7 @@ function fail(message) {
 
 var jsxPath = WScript.Arguments.length > 0 ? WScript.Arguments.Item(0) : "";
 var timeoutSec = WScript.Arguments.length > 1 ? parseInt(WScript.Arguments.Item(1), 10) : 120;
-var photoshopExe = WScript.Arguments.length > 2 ? WScript.Arguments.Item(2) : "";
+var photoshopPath = WScript.Arguments.length > 2 ? WScript.Arguments.Item(2) : "";
 
 if (!jsxPath) {
     fail("Photoshop JSX script path was not provided.");
@@ -170,12 +278,12 @@ if (!filesystem.FileExists(jsxPath)) {
     fail("Photoshop JSX script not found: " + jsxPath);
 }
 
-if (photoshopExe) {
-    if (!filesystem.FileExists(photoshopExe)) {
-        fail("Photoshop executable not found: " + photoshopExe);
+if (photoshopPath) {
+    if (!filesystem.FileExists(photoshopPath)) {
+        fail("Photoshop executable not found: " + photoshopPath);
     }
     var shell = new ActiveXObject("WScript.Shell");
-    shell.Run('"' + photoshopExe + '"', 0, false);
+    shell.Run('"' + photoshopPath + '"', 0, false);
 }
 
 var deadline = new Date().getTime() + Math.max(isNaN(timeoutSec) ? 120 : timeoutSec, 1) * 1000;
@@ -199,6 +307,115 @@ try {
     fail("Photoshop script execution failed: " + error.message);
 }
 "#
+}
+
+fn macos_script_driver() -> &'static str {
+    r#"
+on fail(messageText)
+    error messageText number 1
+end fail
+
+on launchPhotoshop(photoshopPath)
+    if photoshopPath is not "" then
+        do shell script "/usr/bin/open -a " & quoted form of photoshopPath
+    else
+        tell application id "com.adobe.Photoshop" to activate
+    end if
+end launchPhotoshop
+
+on waitForPhotoshop(timeoutSeconds)
+    set deadlineDate to (current date) + timeoutSeconds
+    set lastErrorMessage to ""
+    repeat while (current date) is less than deadlineDate
+        try
+            tell application id "com.adobe.Photoshop"
+                activate
+                do javascript "1;"
+            end tell
+            return
+        on error errMsg number errNum
+            set lastErrorMessage to errMsg & " (" & errNum & ")"
+            delay 0.5
+        end try
+    end repeat
+    fail("Unable to connect to Photoshop via Apple events within timeout. Last error: " & lastErrorMessage)
+end waitForPhotoshop
+
+on run argv
+    if (count of argv) < 2 then
+        fail("Photoshop JSX script path and timeout must be provided.")
+    end if
+
+    set jsxPath to item 1 of argv
+    set timeoutSec to (item 2 of argv) as integer
+    set photoshopPath to ""
+    if (count of argv) ≥ 3 then
+        set photoshopPath to item 3 of argv
+    end if
+
+    if jsxPath is "" then
+        fail("Photoshop JSX script path was not provided.")
+    end if
+
+    set jsxFile to POSIX file jsxPath
+
+    if photoshopPath is not "" then
+        set photoshopBundle to POSIX file photoshopPath
+        tell application "System Events"
+            if not (exists disk item photoshopBundle) then
+                fail("Photoshop application does not exist: " & photoshopPath)
+            end if
+        end tell
+    end if
+
+    launchPhotoshop(photoshopPath)
+    waitForPhotoshop(timeoutSec)
+
+    try
+        tell application id "com.adobe.Photoshop"
+            activate
+            do javascript of file jsxFile
+        end tell
+    on error errMsg number errNum
+        fail("Photoshop script execution failed: " & errMsg & " (" & errNum & ")")
+    end try
+end run
+"#
+}
+
+fn map_macos_driver_failure(stdout: &str, stderr: &str) -> String {
+    let combined = if stdout.is_empty() {
+        stderr.to_string()
+    } else if stderr.is_empty() {
+        stdout.to_string()
+    } else {
+        format!("{stdout} {stderr}")
+    };
+
+    if combined.contains("(-1743)") || combined.contains("Not authorized to send Apple events") {
+        return "Photoshop Automation permission was denied. Allow the calling app to control Photoshop in System Settings > Privacy & Security > Automation, then retry the export.".to_string();
+    }
+
+    if combined.contains("Unable to connect to Photoshop via Apple events within timeout") {
+        return combined;
+    }
+
+    if combined.contains("Photoshop application does not exist:")
+        || combined.contains("Photoshop application must be a .app bundle")
+    {
+        return combined;
+    }
+
+    if combined.contains("application id \"com.adobe.Photoshop\"")
+        || combined.contains("Can’t get application")
+        || combined.contains("Application isn’t running")
+    {
+        return format!(
+            "Unable to connect to Adobe Photoshop on macOS. Verify Photoshop is installed, launchable, and that Automation access is allowed. Driver output: {combined}"
+        );
+    }
+
+    format!("macOS Photoshop automation driver failed: {combined}")
 }
 
 fn build_jsx_script(
@@ -582,10 +799,34 @@ try {{
 
 fn js_path(path: &Path) -> String {
     let raw = path.to_string_lossy();
-    // fs::canonicalize on Windows produces \\?\ extended-length paths.
-    // Photoshop ExtendScript's File() cannot parse that prefix, so strip it.
     let clean = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
-    // ExtendScript File() expects forward slashes.
-    clean.replace('\\', "/")
-        .replace('"', "\\\"")
+    clean.replace('\\', "/").replace('"', "\\\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HostPlatform, host_platform_from, map_macos_driver_failure, validate_macos_photoshop_path};
+
+    #[test]
+    fn host_platform_selection_supports_windows_and_macos() {
+        assert_eq!(host_platform_from("windows"), HostPlatform::Windows);
+        assert_eq!(host_platform_from("macos"), HostPlatform::MacOs);
+        assert_eq!(host_platform_from("linux"), HostPlatform::Unsupported);
+    }
+
+    #[test]
+    fn macos_permission_denial_is_mapped_to_actionable_message() {
+        let message = map_macos_driver_failure("", "execution error: Not authorized to send Apple events to Adobe Photoshop. (-1743)");
+        assert!(message.contains("Automation permission was denied"));
+    }
+
+    #[test]
+    fn macos_photoshop_path_requires_app_bundle() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let bundle_path = temp_dir.path().join("Adobe Photoshop 2025");
+        std::fs::create_dir_all(&bundle_path).expect("fake photoshop dir");
+        let error = validate_macos_photoshop_path(&bundle_path)
+            .expect_err("non-.app path should be rejected");
+        assert!(error.to_string().contains(".app bundle"));
+    }
 }
