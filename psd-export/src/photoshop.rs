@@ -360,9 +360,8 @@ on run argv
     set jsxFile to POSIX file jsxPath
 
     if photoshopPath is not "" then
-        set photoshopBundle to POSIX file photoshopPath
         tell application "System Events"
-            if not (exists disk item photoshopBundle) then
+            if not (exists disk item photoshopPath) then
                 fail("Photoshop application does not exist: " & photoshopPath)
             end if
         end tell
