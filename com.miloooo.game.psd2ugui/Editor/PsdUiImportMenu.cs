@@ -50,14 +50,6 @@ namespace PsdUi.Editor
             try
             {
                 var result = Psd2UguiImportService.ImportPsd(psdPath);
-                if (result.Pipeline != null && result.Pipeline.Warnings != null)
-                {
-                    foreach (var warning in result.Pipeline.Warnings)
-                    {
-                        Debug.LogWarning($"PSD2UGUI warning: {warning}");
-                    }
-                }
-
                 Debug.Log($"Imported PSD to prefab: {result.PrefabPath}");
             }
             catch (Exception exception)

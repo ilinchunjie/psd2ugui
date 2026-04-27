@@ -33,7 +33,6 @@ namespace PsdUi.Editor
             [JsonProperty("plan_path")] public string PlanPath { get; set; } = string.Empty;
             [JsonProperty("validation_report_path")] public string ValidationReportPath { get; set; } = string.Empty;
             [JsonProperty("document_id")] public string DocumentId { get; set; } = string.Empty;
-            [JsonProperty("warnings")] public string[] Warnings { get; set; } = Array.Empty<string>();
         }
 
         private sealed class SystemProcessRunner : IProcessRunner
